@@ -150,14 +150,19 @@ def _build_attempt_plan():
     return [(GEMINI_MODEL, 0), (GEMINI_MODEL, 2), (GEMINI_MODEL, 5)]
 
 
-def build_clean_sentence(row):
-    # 학생 화면과 동일한 '기호 없는 원문장' (raw_sentence가 비어 있으면 sentence에서 자동 생성)
-    raw = str(row.get("raw_sentence", "")).strip()
-    if raw and raw != "None":
-        return raw
-    clean = re.sub(r"[()\[\]/]", " ", str(row["sentence"]))
+def strip_analysis_marks(sentence):
+    # 구문 분석 문장에서 기호(/, (), [])를 지워 학생용 '기호 없는 원문장'을 만듦
+    clean = re.sub(r"[()\[\]/]", " ", str(sentence))
     clean = re.sub(r"\s+", " ", clean).strip()
     return re.sub(r"\s+([.,?!])", r"\1", clean)
+
+
+def build_clean_sentence(row):
+    # 학생 화면과 동일한 '기호 없는 원문장' (raw_sentence가 비어 있으면 sentence에서 자동 생성)
+    raw = _safe_text(row.get("raw_sentence"))
+    if raw:
+        return raw
+    return strip_analysis_marks(_safe_text(row.get("sentence")))
 
 
 def _safe_text(value):
@@ -259,7 +264,7 @@ def grade_translations_batch(items):
 
 
 def grade_submission(active_questions_df, local_inputs, chunk_inputs):
-    """TA 채점(기존 로직 그대로) + 해석 AI 일괄 채점.
+    """TA 채점(칸별 채점 + 괄호 검사) + 해석 AI 일괄 채점.
     반환: (오답 문항 수, feedback_dict, answers_dict) / AI 실패 시 GradingError 발생"""
     feedback_dict = {}
     answers_dict = {}
@@ -269,70 +274,71 @@ def grade_submission(active_questions_df, local_inputs, chunk_inputs):
 
     for _, row in active_questions_df.iterrows():
         q_id = row["id"]
-        ans_ta = row["answer_ta"]
-        ta_answers = [t.strip().lower() for t in ans_ta.split("/")]
+        ta_answers = [
+            t.strip().lower() for t in _safe_text(row.get("answer_ta")).split("/")
+        ]
 
         student_chunked_now = chunk_inputs.get(q_id, "")
 
         # 👉 제출 시에도 쪼갠 구문 텍스트를 저장하여 복구 대비
         answers_dict[f"chunk_input_{q_id}"] = student_chunked_now
 
-        # 💡 제출 시에도 동일한 스냅 로직 적용하여 정확한 채점 덩어리 산정
-        def get_core_chunks(text):
-            t = text.lower()
-            for c in " ',.:;-()[]?!":
-                t = t.replace(c, "")
-            return t.split("/")
-
-        if get_core_chunks(student_chunked_now) == get_core_chunks(row["sentence"]):
-            student_chunked_clean_now = row["sentence"]
-        else:
-            student_chunked_clean_now = student_chunked_now
-
-        student_chunks_count = len(student_chunked_clean_now.split("/"))
-
+        # 💡 구문 검사 (학생 화면과 같은 함수): 괄호 + 칸마다 정답 칸과 나눈 위치가 같은지
+        structure = analyze_structure(student_chunked_now, row)
         is_question_wrong = False
 
-        if student_chunks_count != len(ta_answers):
+        # 괄호가 정답과 다르면 이 문항은 오답 (칸별 TA 채점은 그대로 진행해서 결과를 보여줌)
+        feedback_dict[f"bracket_{q_id}"] = structure["bracket_ok"]
+        if not structure["bracket_ok"]:
             is_question_wrong = True
-            for i in range(student_chunks_count):
-                input_key = f"ta_{q_id}_{i}"
-                student_ans = local_inputs.get(input_key, "").strip().lower()
-                answers_dict[input_key] = student_ans
+
+        for i, teacher_idx in enumerate(structure["matched"]):
+            input_key = f"ta_{q_id}_{i}"
+            student_ans = str(local_inputs.get(input_key, "") or "").strip().lower()
+            answers_dict[input_key] = student_ans
+
+            if teacher_idx is None:
+                # 정답 칸과 나눈 위치가 다른 칸 → 이 칸만 구문 분석 오류
                 feedback_dict[input_key] = "CHUNK_ERROR"
-        else:
-            for i, correct_ta in enumerate(ta_answers):
-                input_key = f"ta_{q_id}_{i}"
-                student_ans = local_inputs.get(input_key, "").strip().lower()
-                answers_dict[input_key] = student_ans
-
-                # 💡 복수 정답(괄호) 집합(Set) 분리 및 공백 완벽 제거 로직
-                correct_ta_clean = correct_ta.replace(" ", "")
-                student_ans_clean = student_ans.replace(" ", "")
-
-                teacher_opts = set(
-                    p for p in correct_ta_clean.replace(")", "(").split("(") if p
+                is_question_wrong = True
+                continue
+            if teacher_idx >= len(ta_answers):
+                # 선생님이 입력한 TA 칸 수가 구문 분석 문장보다 적은 경우 (출제 데이터 문제) → 안전하게 오답
+                print(
+                    f"[채점] 문항 {q_id}: 구문 분석 문장과 TA 정답의 칸 수가 다릅니다"
                 )
-                student_opts = set(
-                    p for p in student_ans_clean.replace(")", "(").split("(") if p
-                )
+                feedback_dict[input_key] = False
+                is_question_wrong = True
+                continue
+            correct_ta = ta_answers[teacher_idx]
 
-                if not teacher_opts:  # 선생님이 정답 칸을 비워둔 경우
-                    if student_opts:  # 학생이 빈칸에 무언가 적었다면 오답 처리
-                        feedback_dict[input_key] = False
-                        is_question_wrong = True
-                    else:
+            # 💡 복수 정답(괄호) 집합(Set) 분리 및 공백 완벽 제거 로직
+            correct_ta_clean = correct_ta.replace(" ", "")
+            student_ans_clean = student_ans.replace(" ", "")
+
+            teacher_opts = set(
+                p for p in correct_ta_clean.replace(")", "(").split("(") if p
+            )
+            student_opts = set(
+                p for p in student_ans_clean.replace(")", "(").split("(") if p
+            )
+
+            if not teacher_opts:  # 선생님이 정답 칸을 비워둔 경우
+                if student_opts:  # 학생이 빈칸에 무언가 적었다면 오답 처리
+                    feedback_dict[input_key] = False
+                    is_question_wrong = True
+                else:
+                    feedback_dict[input_key] = True
+            else:  # 선생님 정답이 존재하는 경우
+                if not student_opts:  # 학생이 칸을 비워두면 오답 처리
+                    feedback_dict[input_key] = False
+                    is_question_wrong = True
+                else:
+                    if student_opts.issubset(teacher_opts):
                         feedback_dict[input_key] = True
-                else:  # 선생님 정답이 존재하는 경우
-                    if not student_opts:  # 학생이 칸을 비워두면 오답 처리
+                    else:
                         feedback_dict[input_key] = False
                         is_question_wrong = True
-                    else:
-                        if student_opts.issubset(teacher_opts):
-                            feedback_dict[input_key] = True
-                        else:
-                            feedback_dict[input_key] = False
-                            is_question_wrong = True
 
         # 💡 해석 채점: 미출제는 통과, 빈칸은 오답, 나머지는 AI 일괄 채점 대상으로 수집
         trans_key = f"trans_{q_id}"
@@ -416,6 +422,122 @@ def ensure_period(sentence):
     if s and not s.endswith("."):
         s += "."
     return s
+
+
+# ==========================================
+# [구문 검사] 학생이 넣은 슬래시(/)·괄호 검사 — 학생 화면·제출·채점이 모두 같은 함수를 사용
+#  - 띄어쓰기·문장부호 앞뒤 어디에 쳐도 같은 답 (알파벳·숫자 기준으로 비교)
+#  - 선생님이 연달아 친 같은 종류 괄호는 학생이 하나로 합쳐도 정답 (쪼개기·생략·추가·이동은 오답)
+# ==========================================
+def _alnum(text):
+    # 알파벳·숫자만 남김 (띄어쓰기·문장부호·기호는 모두 무시)
+    return re.sub(r"[^a-zA-Z0-9]", "", str(text)).lower()
+
+
+def _bracket_skeleton(text):
+    # 알파벳·숫자·괄호만 남김 (괄호 위치 비교용)
+    return re.sub(r"[^a-zA-Z0-9\(\)\[\]]", "", str(text)).lower()
+
+
+def bracket_balance_message(text):
+    # 학생 입력 자체의 괄호 짝 검사 (정답과 비교하지 않으므로 정답이 드러나지 않음). 이상 없으면 ""
+    counts = []
+    for open_ch, close_ch in (("(", ")"), ("[", "]")):
+        n_open, n_close = text.count(open_ch), text.count(close_ch)
+        if n_open != n_close:
+            counts.append(f"`{open_ch}` {n_open}개, `{close_ch}` {n_close}개")
+    if counts:
+        return (
+            "괄호 짝이 맞지 않습니다! 여는 괄호와 닫는 괄호의 개수를 맞춰 주십시오. ("
+            + " / ".join(counts)
+            + ")"
+        )
+    stack = []
+    for ch in text:
+        if ch in "([":
+            stack.append(ch)
+        elif ch in ")]":
+            if not stack or stack.pop() != {")": "(", "]": "["}[ch]:
+                return "괄호 짝이 맞지 않습니다! 여는 괄호와 닫는 괄호의 순서와 종류를 확인해 주십시오."
+    return ""
+
+
+def brackets_match(student_text, teacher_sentence):
+    # 학생 괄호 위치가 정답과 같은지. 선생님 문장에서 바로 붙어 있는 ')(' / ']['는 학생이 합쳐도 정답
+    teacher = _bracket_skeleton(teacher_sentence)
+    student = _bracket_skeleton(student_text)
+    if student == teacher:
+        return True
+    pattern, i = [], 0
+    while i < len(teacher):
+        pair = teacher[i : i + 2]
+        if pair in (")(", "]["):
+            pattern.append(
+                "(?:" + re.escape(pair) + ")?"
+            )  # 있어도 되고 없어도 되는 자리
+            i += 2
+        else:
+            pattern.append(re.escape(teacher[i]))
+            i += 1
+    return re.fullmatch("".join(pattern), student) is not None
+
+
+def chunk_spans(chunks):
+    # 칸마다 원문의 알파벳·숫자 기준 (시작, 끝) 위치
+    spans, pos = [], 0
+    for chunk in chunks:
+        length = len(_alnum(chunk))
+        spans.append((pos, pos + length))
+        pos += length
+    return spans
+
+
+def analyze_structure(student_text, row):
+    """학생이 나눈 문장 검사 결과 (dict)
+    - chunks: 학생 입력을 슬래시로 나눈 칸 (TA 입력칸 기준) / display_chunks: 화면에 보여줄 칸 글자
+    - touched: 원문 그대로인 처음 상태가 아님 / is_empty: 입력이 비어 있음
+    - word_ok: 알파벳·숫자가 원문과 같음 / balance_msg: 괄호 짝 안내("" = 이상 없음)
+    - bracket_ok: 괄호 짝이 맞고 위치가 정답과 같음(합치기 허용)
+    - matched: 칸마다 대응하는 정답 칸 번호 (나눈 위치가 정답과 다르면 None)"""
+    text = str(student_text or "").replace("\n", " ")
+    raw = build_clean_sentence(row)
+    teacher = _safe_text(row.get("sentence"))
+    chunks = text.split("/")
+    teacher_chunks = teacher.split("/")
+
+    balance_msg = bracket_balance_message(text)
+    bracket_ok = not balance_msg and brackets_match(text, teacher)
+
+    # 칸의 시작·끝 위치가 정답 칸과 똑같을 때만 '잘 나눈 칸'
+    teacher_by_span = {}
+    for j, span in enumerate(chunk_spans(teacher_chunks)):
+        teacher_by_span.setdefault(span, []).append(j)
+    matched = []
+    for span in chunk_spans(chunks):
+        candidates = teacher_by_span.get(span)
+        matched.append(candidates.pop(0) if candidates else None)
+    all_matched = len(chunks) == len(teacher_chunks) and all(
+        m is not None for m in matched
+    )
+
+    # 💡 칸 나누기와 괄호가 정답과 완전히 같으면 선생님 표기로 깔끔하게 표시, 아니면 학생이 쓴 그대로
+    if all_matched and _bracket_skeleton(text) == _bracket_skeleton(teacher):
+        display_chunks = [c.strip() for c in teacher_chunks]
+    else:
+        display_chunks = [c.strip() for c in chunks]
+
+    return {
+        "text": text,
+        "chunks": chunks,
+        "display_chunks": display_chunks,
+        "touched": text != raw,
+        "is_empty": not text.strip(),
+        "word_ok": _alnum(text) == _alnum(raw),
+        "balance_msg": balance_msg,
+        "bracket_ok": bracket_ok,
+        "matched": matched,
+        "all_matched": all_matched,
+    }
 
 
 # ==========================================
@@ -801,18 +923,39 @@ QUESTION_COLUMNS = [
 ]
 
 
+def question_sort_key(set_name, order_num, q_id):
+    # 문제 정렬 기준: 세트 이름 → 순서 번호 → id
+    # 💡 세트 이름은 사람이 읽는 순서로 정렬 ("Set 2"가 "Set 10"보다 앞)
+    name = _safe_text(set_name) or "기본 세트"
+    name_key = tuple(
+        (0, int(part), "") if part[0] in "0123456789" else (1, 0, part.lower())
+        for part in re.split(r"([0-9]+)", name)
+        if part
+    )
+    try:
+        order_key = int(order_num)
+    except (TypeError, ValueError):
+        order_key = 999
+    try:
+        id_key = int(q_id)
+    except (TypeError, ValueError):
+        id_key = 0
+    # name을 한 번 더 넣어 "Set 1"과 "Set 01"처럼 숫자만 같은 세트가 서로 섞이지 않게 함
+    return (name_key, name, order_key, id_key)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_all_questions(only_active=False):
     # 💡 화면이 다시 그려질 때마다 DB를 부르지 않도록 잠시 보관 (선생님이 저장하면 즉시 비움)
     cols = ", ".join(QUESTION_COLUMNS)
     if only_active:
-        sql = f"SELECT {cols} FROM questions WHERE is_active = 1 ORDER BY order_num ASC, id ASC"
+        sql = f"SELECT {cols} FROM questions WHERE is_active = 1"
     else:
-        sql = (
-            f"SELECT {cols} FROM questions ORDER BY set_name ASC, order_num ASC, id ASC"
-        )
+        sql = f"SELECT {cols} FROM questions"
     with _db().transaction() as t:
         rows = t.all(sql)
+    # 💡 여러 세트를 함께 출제해도 세트별로 묶어서 순서대로 표시 (학생 화면·제출 기록·DB 관리 탭 공통)
+    rows.sort(key=lambda r: question_sort_key(r["set_name"], r["order_num"], r["id"]))
     df = pd.DataFrame(rows, columns=QUESTION_COLUMNS)
 
     # 💡 어떤 값이 저장돼 있어도 화면·채점에는 항상 표준 모드 값과 빈 문자열 메모로 전달
@@ -862,9 +1005,7 @@ def update_db_from_combined(df, set_active_states, set_trans_modes):
         set_name_val = _safe_text(row.get("set_name")) or "기본 세트"
         raw_val = _safe_text(row.get("raw_sentence"))
         if not raw_val:
-            clean = re.sub(r"[()\[\]/]", " ", sentence_text)
-            clean = re.sub(r"\s+", " ", clean).strip()
-            raw_val = re.sub(r"\s+([.,?!])", r"\1", clean)
+            raw_val = strip_analysis_marks(sentence_text)
         order_raw = row.get("order_num")
         order_num_val = int(order_raw) if pd.notna(order_raw) else 999
 
@@ -1311,7 +1452,11 @@ def count_ai_wrong(feedback, questions):
         ta_wrong = any(
             v is not True for k, v in feedback.items() if k.startswith(prefix)
         )
-        if ta_wrong or feedback.get(f"trans_{q['id']}") is False:
+        if (
+            ta_wrong
+            or feedback.get(f"trans_{q['id']}") is False
+            or feedback.get(f"bracket_{q['id']}") is False
+        ):
             wrong += 1
     return wrong
 
@@ -1339,7 +1484,9 @@ def export_backup_zip():
 def clear_student_inputs():
     # 화면의 입력칸(분절·TA·해석) 값을 모두 비움 (다른 학생·다른 시험 값이 남지 않도록)
     for k in list(st.session_state.keys()):
-        if k.startswith(("chunk_input_", "input_ta_", "input_trans_")):
+        if k.startswith(
+            ("chunk_input_", "input_ta_", "input_trans_", "ta_layout_", "ta_memory_")
+        ):
             del st.session_state[k]
 
 
@@ -1368,6 +1515,61 @@ def collect_current_answers():
         elif k.startswith("input_ta_") or k.startswith("input_trans_"):
             draft_dict[k.replace("input_", "", 1)] = v
     return draft_dict
+
+
+def _chunk_content_keys(chunks):
+    # 칸마다 '알파벳·숫자 내용#같은 내용 중 몇 번째' (예: "is#0", "is#1") — 태그 옮겨주기 기준
+    seen, keys = {}, []
+    for chunk in chunks:
+        content = _alnum(chunk)
+        n = seen.get(content, 0)
+        seen[content] = n + 1
+        keys.append(f"{content}#{n}")
+    return keys
+
+
+def prepare_ta_inputs(q_id, chunks):
+    """TA 입력칸 값을 현재 칸 목록에 맞춰 준비 (입력칸을 그리기 직전에 호출)
+    - 처음 그릴 때: 불러온 답안(칸 순서 기준)을 그대로 사용
+    - 슬래시를 넣거나 빼서 칸이 바뀌면: 내용이 같은 칸은 태그를 따라 옮기고, 새로 생긴 칸은 빈칸
+      (띄어쓰기·문장부호·괄호만 고친 경우는 칸 내용이 같으므로 태그가 그대로 유지됨)"""
+    layout_key = f"ta_layout_{q_id}"
+    memory_key = f"ta_memory_{q_id}"
+    new_layout = _chunk_content_keys(chunks)
+    old_layout = st.session_state.get(layout_key)
+    memory = dict(st.session_state.get(memory_key) or {})
+    saved = st.session_state.user_inputs
+
+    if old_layout is not None and old_layout != new_layout:
+        # 바뀌기 직전의 태그를 칸 내용별로 기억 (나중에 같은 칸이 다시 생기면 되살림)
+        for i, content_key in enumerate(old_layout):
+            widget_key = f"input_ta_{q_id}_{i}"
+            if widget_key in st.session_state:
+                memory[content_key] = str(st.session_state[widget_key] or "")
+        for i, content_key in enumerate(new_layout):
+            st.session_state[f"input_ta_{q_id}_{i}"] = memory.get(content_key, "")
+        # 없어진 칸의 값 정리 (임시저장에 옛 칸 값이 남지 않도록)
+        for store, prefix in (
+            (st.session_state, f"input_ta_{q_id}_"),
+            (saved, f"ta_{q_id}_"),
+        ):
+            for k in list(store.keys()):
+                rest = k[len(prefix) :] if k.startswith(prefix) else ""
+                if rest.isdigit() and int(rest) >= len(new_layout):
+                    del store[k]
+    else:
+        for i, content_key in enumerate(new_layout):
+            widget_key = f"input_ta_{q_id}_{i}"
+            if widget_key not in st.session_state:
+                if content_key in memory:
+                    st.session_state[widget_key] = memory[content_key]
+                else:
+                    st.session_state[widget_key] = str(
+                        saved.get(f"ta_{q_id}_{i}", "") or ""
+                    )
+
+    st.session_state[layout_key] = new_layout
+    st.session_state[memory_key] = memory
 
 
 # ==========================================
@@ -1608,9 +1810,11 @@ if st.session_state.role == "teacher":
 
     with tab1:
         st.info(
-            "👨‍🏫 **선생님 운영 가이드라인:** 이곳에서 수동으로 새로운 문제를 출제할 수 있습니다.\n\n"
-            "🎯 **[원문장 자동 생성]** 구문 분석 문장 칸에 기호(`/`, `()`, `[]`)를 넣으면, 학생용 화면에서는 기호가 완벽히 삭제된 '깔끔한 원문장'이 자동 생성됩니다.\n\n"
-            "💡 **[복수 정답 허용]** `분구(vt)`처럼 괄호를 묶어 정답을 입력하면, 학생이 순서를 바꾸거나 띄어쓰기를 다르게 해도 시스템이 의미를 파악해 모두 정답 처리합니다! 💯"
+            "👨‍🏫 **선생님 운영 가이드라인:** 이곳에서 새로운 문제를 한 문제씩 추가할 수 있습니다. 추가한 문제는 **출제 대기** 상태로 저장되며, [📁 DB 관리 및 출제] 탭에서 세트를 출제하면 학생 화면에 나타납니다.\n\n"
+            "✂️ **[구문 분석 문장]** 슬래시(`/`)로 칸을 나누고 괄호 `()`, `[]`로 구문을 묶어 주십시오. 학생 화면에는 기호가 모두 빠진 원문장이 보이며, 학생은 **나눈 위치와 괄호까지 정확해야** 정답입니다.\n\n"
+            "⚠️ **[원문장 확인]** 원문장과 구문 분석 문장의 단어(철자)가 똑같아야 합니다. 한 글자라도 다르면 학생이 그 문항을 맞힐 수 없으니 추가하기 전에 꼭 확인해 주십시오.\n\n"
+            "💡 **[복수 정답 허용]** `분구(vt)`처럼 괄호를 묶어 정답을 입력하면, 학생이 순서를 바꾸거나 띄어쓰기를 다르게 해도 모두 정답 처리합니다! 💯 TA 정답의 칸을 비워 두면(예: `prep / / S`) 학생도 그 칸을 비워야 정답입니다.\n\n"
+            "📝 **[채점 메모]** 이 문항만 특별히 봐야 할 해석 기준이 있다면 적어 주십시오. AI가 공통 채점 기준보다 메모를 먼저 따릅니다."
         )
         col_t1, col_t2 = st.columns([4, 1])
         with col_t1:
@@ -1690,9 +1894,10 @@ if st.session_state.role == "teacher":
         st.info(
             "📊 **성적 현황 가이드**\n"
             "* 🗂️ **[시험 선택]** 위에서 시험(출제한 세트 묶음)을 고르면 그 시험의 성적만 보여요! 같은 세트 묶음을 다시 출제하면 이전 기록이 이어집니다.\n"
-            "* ✏️ **[점수 수정]** AI 판정이 애매하다면 아래 상세 답안지를 확인한 뒤 표의 오답 수를 고치고 저장하세요. 통과·진행·선생님 호출 상태는 자동으로 다시 계산됩니다! ✨\n"
+            "* ✏️ **[점수 수정]** AI 판정이 애매하다면 아래 상세 답안지를 확인한 뒤 표의 오답 수를 고치고 저장하세요. 통과·진행·선생님 호출 상태는 자동으로 다시 계산됩니다! ✨ 고친 차수는 답안지에 ✏️ 표시가 남아요.\n"
             "* 🗑️ **[기록 삭제]** 🗑️ 칸을 체크하고 저장하면 **이 시험의 해당 학생 기록만** 삭제돼요. 다른 시험 기록은 안전합니다.\n"
-            "* 🔄 **[재응시]** 학생을 골라 `재응시 허용`을 누르면 그 학생만 1차부터 다시 볼 수 있어요! 복습으로 같은 세트를 다시 낼 때는 `전체 재응시`를 사용하세요. 이전 기록은 상세 답안지에서 회차별로 확인할 수 있습니다. 📚"
+            "* 🔄 **[재응시]** 학생을 골라 `재응시 허용`을 누르면 그 학생만 1차부터 다시 볼 수 있어요! 복습으로 같은 세트를 다시 낼 때는 `전체 재응시`를 사용하세요. 이전 기록은 상세 답안지에서 회차별로 확인할 수 있습니다. 📚\n"
+            "* 🔍 **[상세 답안지]** 학생이 구문을 어떻게 나눴는지, 칸별 결과(✅ 정답 / ❌ 오답 / ✂️ 나눈 위치가 다름), 괄호 오류, AI 판정 사유까지 한눈에 보여요! 지금 출제 중인 시험은 **제출 전 작성 중인 답안**도 볼 수 있습니다. 👀"
         )
 
         # 저장·재응시 후 새로고침된 화면에서 결과 메시지를 한 번 표시
@@ -1702,43 +1907,61 @@ if st.session_state.role == "teacher":
 
         def render_answer_sheet(questions, answers, feedback, model_used, is_draft):
             # 답안지 한 장 표시 (제출 당시 문제 스냅샷 기준). 학생 입력은 html.escape로 안전하게 표시
+            # 💡 세트 → 순서 번호 기준으로 정렬 (예전에 섞인 순서로 저장된 답안지도 정리해서 표시)
+            questions = sorted(
+                questions,
+                key=lambda q: question_sort_key(
+                    q.get("set_name"), q.get("order_num"), q.get("id")
+                ),
+            )
             with st.container(border=True):
                 for idx, q in enumerate(questions):
                     q_id = q["id"]
                     st.markdown(f"**{idx + 1}. {q['raw_sentence']}**")
 
                     ta_prefix = f"ta_{q_id}_"
-                    is_chunk_error = any(
-                        v == "CHUNK_ERROR"
-                        for k, v in feedback.items()
-                        if k.startswith(ta_prefix)
+                    # 💡 학생이 나눈 칸 순서대로 표시 (✅ 정답 / ❌ 오답 / ✂️ 나눈 위치가 정답과 다름)
+                    chunk_text = (
+                        str(answers.get(f"chunk_input_{q_id}", "") or "")
+                        .replace("\n", " ")
+                        .strip()
                     )
-                    if is_chunk_error:
+                    if chunk_text:
                         st.markdown(
-                            "<div style='font-weight:bold; color:#721c24;'>학생 TA 제출안: ❌ 구문 나누기 오류 (정답과 의미 단위 개수가 다릅니다)</div>",
+                            f"<div style='color:#64748B;'>학생 구문 나누기: {html.escape(chunk_text)}</div>",
                             unsafe_allow_html=True,
                         )
-                    else:
-                        parts = []
-                        for i in range(len(q["answer_ta"].split("/"))):
-                            input_key = f"{ta_prefix}{i}"
-                            if input_key in answers:
-                                if is_draft:
-                                    icon = "📝"
-                                else:
-                                    icon = (
-                                        "✅"
-                                        if feedback.get(input_key) == True
-                                        else "❌"
-                                    )
-                                parts.append(
-                                    f"{icon} {html.escape(str(answers[input_key]))}"
-                                )
-                        ta_result_str = " / ".join(parts) if parts else "(미제출)"
+                    if not is_draft and feedback.get(f"bracket_{q_id}") is False:
                         st.markdown(
-                            f"<div style='font-weight:bold;'>학생 TA 제출안: {ta_result_str}</div>",
+                            "<div style='font-weight:bold; color:#721c24;'>❌ 괄호 오류 (괄호 위치나 개수가 정답과 다릅니다)</div>",
                             unsafe_allow_html=True,
                         )
+                    ta_indices = sorted(
+                        int(k[len(ta_prefix) :])
+                        for k in answers
+                        if k.startswith(ta_prefix) and k[len(ta_prefix) :].isdigit()
+                    )
+                    parts = []
+                    has_chunk_error = False
+                    for i in ta_indices:
+                        input_key = f"{ta_prefix}{i}"
+                        if is_draft:
+                            icon = "📝"
+                        elif feedback.get(input_key) == "CHUNK_ERROR":
+                            icon = "✂️"
+                            has_chunk_error = True
+                        elif feedback.get(input_key) == True:
+                            icon = "✅"
+                        else:
+                            icon = "❌"
+                        parts.append(f"{icon} {html.escape(str(answers[input_key]))}")
+                    ta_result_str = " / ".join(parts) if parts else "(미제출)"
+                    if has_chunk_error:
+                        ta_result_str += " <span style='color:#721c24; font-weight:normal;'>(✂️ = 나눈 위치가 정답과 다른 칸)</span>"
+                    st.markdown(
+                        f"<div style='font-weight:bold;'>학생 TA 제출안: {ta_result_str}</div>",
+                        unsafe_allow_html=True,
+                    )
 
                     trans_key = f"trans_{q_id}"
                     trans_val = html.escape(str(answers.get(trans_key, "(미입력)")))
@@ -2029,9 +2252,11 @@ if st.session_state.role == "teacher":
         st.header("📁 전체 DB 관리 및 세트 출제")
         st.info(
             "**📁 전체 DB 관리 및 세트 출제 가이드**\n"
-            "* **[원클릭 출제]** 세트(폴더)를 펼치고 `이 세트 출제하기` 체크박스를 켜면 즉시 학생들 화면에 시험지가 노출됩니다.\n"
+            "* **[원클릭 출제]** 세트(폴더)를 펼치고 `이 세트 출제하기` 체크박스를 켜면 즉시 학생들 화면에 시험지가 노출됩니다. 여러 세트를 함께 출제하면 **세트 순서대로**(Set 1 → Set 2 → … → Set 10) 묶여서 나옵니다.\n"
+            "* **[시험 구분]** 함께 출제한 세트 묶음이 하나의 시험이 됩니다. (예: `Set 1`과 `Set 1 + Set 2`는 서로 다른 시험) 같은 묶음을 다시 출제하면 이전 기록이 이어지고, **세트 이름을 바꾸면 다른 시험으로 기록**되니 주의해 주십시오. 🗂️\n"
             "* **[맞춤형 해석 모드]** 우측의 `해석 출제 모드`를 변경하여 세트별로 요구하는 해석 기준(전체/핵심구/미출제)을 다르게 설정할 수 있습니다. ⚙️\n"
-            "* 수정 후 아래 `저장` 버튼을 누르면 즉시 모든 변경사항이 반영됩니다! 💾"
+            "* **[문제 수정·순서·삭제]** 표에서 내용을 바로 고치고, `순서` 칸으로 세트 안의 문제 순서를 정하고, 🗑️ 칸을 체크해 삭제할 수 있습니다. 원문장 칸을 비워 두고 저장하면 구문 분석 문장에서 자동으로 만들어집니다. ✍️\n"
+            "* 수정 후 아래 `저장` 버튼을 누르면 즉시 모든 변경사항이 반영됩니다! 💾 맨 아래 `📦 백업 파일 만들기`로 문제·성적·답안을 파일 하나로 내려받을 수 있으니, **일주일에 한 번** 백업해 두시길 권장합니다."
         )
         db_df = get_all_questions(only_active=False)
         if not db_df.empty:
@@ -2184,13 +2409,17 @@ if st.session_state.role == "teacher":
         st.header("💡 시스템 Insight")
 
         st.markdown("""
-        ### 1. 📝 문제 출제 및 데이터 관리
+        ### 1. 🎯 채점 원리
         
-        *   **원문장 자동 생성:** 학생들의 시험지에는 힌트가 될 수 있는 기호(`()`, `[]`, `/`)가 완전히 제거된 **깔끔한 원문장**이 노출됩니다. 선생님께서 문제 출제 시 구문 분석 문장 칸에만 기호를 넣어주시면 시스템이 똑똑하게 기호를 지워 **학생용 원문장**을 만들어 냅니다.
+        *   **문항 정답 기준:** 한 문항은 **구문 나누기·괄호·성분·해석이 모두 맞아야** 정답입니다. 모든 문항을 맞힌 차수에 `PASS_1`(1차 통과)처럼 기록되고, 3차까지 통과하지 못하면 `FAIL`이 되어 선생님 확인이 필요한 상태가 됩니다.
         
-        *   **자유로운 복수 정답 인정:** `분구(vt)` 처럼 괄호를 묶어 정답을 입력해 보세요. 학생들이 `vt(분구)` 로 순서를 바꾸어 적거나 띄어쓰기를 다르게 하더라도 시스템이 의미를 파악해 **모두 정답으로 인정**합니다.
+        *   **구문 나누기:** 슬래시(`/`)의 **위치까지** 채점합니다. 띄어쓰기나 문장부호(쉼표·세미콜론·따옴표 등) 앞뒤 어디에 쳐도 같은 답으로 보며(`I/ love/you.` = `I / love / you.`), 단어 중간을 나누면 오답입니다.
         
-        *   **원클릭 출제 및 모드 설정:** [📁 DB 관리 및 출제] 탭에서 특정 세트를 출제하고, 세트별로 **해석 출제 모드(전체/핵심구/미출제)**를 다르게 설정하여 학생들 화면에 즉시 반영할 수 있습니다.
+        *   **칸별 부분 채점:** 잘못 나눈 칸만 ✂️로 표시하고, 올바르게 나눈 칸은 성분을 따로 채점합니다. 학생은 어디서 틀렸는지 정확히 알 수 있습니다.
+        
+        *   **괄호:** 위치와 개수가 정확해야 합니다. 단, 선생님이 연달아 친 괄호(`(A) (B)`)는 학생이 하나로 묶어도(`(A B)`) 정답입니다. 괄호를 쪼개거나 빼거나 더하면 **'괄호 오류'**로 그 문항은 오답이 됩니다.
+        
+        *   **AI 해석 채점:** 선생님과 함께 정한 채점 기준에 따라 채점합니다. 사소한 맞춤법·유의어는 인정하고 치명적인 오역은 오답 처리하며, **'핵심구 해석'** 모드에서는 핵심 어구만 들어 있으면 통과입니다. 채점 연결이 잠시 불안정하면 자동으로 다시 시도합니다.
         """)
 
         st.write("<br>", unsafe_allow_html=True)
@@ -2198,13 +2427,15 @@ if st.session_state.role == "teacher":
         st.write("<br>", unsafe_allow_html=True)
 
         st.markdown("""
-        ### 2. 👧 학생 응시 및 똑똑한 채점 원리
+        ### 2. 👧 학생 화면에서 일어나는 일
         
-        *   **스마트 구문 보정 (Snap 로직):** 학생들이 구문을 나누는 슬래시(`/`)를 올바른 위치에 넣었다면, 괄호 `()`, `[]` 의 자리를 띄어쓰기 등으로 조금 헷갈리게 입력하더라도 선생님이 출제하신 깔끔한 형태의 **의미 단위**로 자동 보정되어 화면에 통일감 있게 나타납니다.
+        *   **써 둔 답 보호:** 괄호를 잘못 쳐도 써 둔 성분·해석이 사라지지 않습니다. 슬래시를 넣거나 빼도 **내용이 같은 칸의 성분은 그대로 따라갑니다.**
         
-        *   **엄격한 괄호 검증:** 학생들이 임의로 괄호를 생략하거나 묶어서 제출하면 시스템이 이를 **'구문 훼손 오류'**로 간주합니다. 이는 학생들에게 **문법 성분 단위로 정확히 괄호를 치는 훈련**을 유도하기 위한 장치입니다.
+        *   **제출 전 괄호 안내:** 괄호 짝이 안 맞거나 괄호가 정답과 다르면 제출 전에 안내 문구가 떠서, 학생이 스스로 다시 확인할 수 있습니다. **어디가 틀렸는지는 알려주지 않습니다.**
         
-        *   **결정론적 AI 해석 채점:** 학생이 작성한 해석은 무작위성이 제거된 AI가 일관되게 채점합니다. 사소한 맞춤법이나 유의어는 정답으로 인정하되 치명적인 오역은 깐깐하게 오답 처리하며, **'핵심구 해석' 모드**에서는 세부 디테일이 생략되어도 핵심 어구만 포함되면 통과됩니다.
+        *   **채점 결과 표시:** 채점 후 칸마다 ✅ / ❌ / ✂️가 표시됩니다. 학생이 고친 칸은 **'✏️ 수정됨'**으로 바뀌어, 다시 제출할 부분을 스스로 파악할 수 있습니다.
+        
+        *   **태블릿·PC 최적화:** 화면 폭에 맞춰 나뉜 구문이 알아서 줄바꿈되어, 아이패드에서도 찌그러지지 않습니다.
         """)
 
         st.write("<br>", unsafe_allow_html=True)
@@ -2212,23 +2443,17 @@ if st.session_state.role == "teacher":
         st.write("<br>", unsafe_allow_html=True)
 
         st.markdown("""
-        ### 3. 📊 성적 현황 및 피드백 연동
+        ### 3. 🛡️ 기록 보관과 안전장치
         
-        *   **실시간 상태 업데이트:** 학생들의 응시 횟수(1차~3차)와 채점 결과에 따라 상태가 `PASS_1`, `FAIL` 등으로 표에 **자동으로 연동**되어 표기됩니다.
+        *   **안전한 영구 보관:** 모든 문제·성적·답안은 별도의 안전한 저장 공간에 보관되어, 사이트가 재시작되어도 사라지지 않습니다.
         
-        *   **수동 성적 조정:** 선생님께서 학생의 성적을 표에서 직접 더블클릭하여 수정하고 저장하시면, 시스템이 바뀐 점수에 맞춰 학생의 합격/불합격 상태도 똑똑하게 **자동으로 업데이트**합니다.
-        """)
-
-        st.write("<br>", unsafe_allow_html=True)
-        st.divider()
-        st.write("<br>", unsafe_allow_html=True)
-
-        st.markdown("""
-        ### 4. 💾 안정성 및 기기 맞춤형 UI
+        *   **제출 당시 그대로의 답안지:** 답안지는 학생이 제출한 **그 순간의 문제 기준**으로 보관됩니다. 나중에 문제를 고치거나 지워도 옛 답안지는 바뀌지 않습니다.
         
-        *   **완벽한 자동 복구:** 응시 중 창을 닫아도 이름을 다시 입력하면 **최근 임시저장 및 제출했던 분절 상태와 입력값이 100% 자동 복구**됩니다. 서버 동시 접속 시에도 뻗음 없이 매끄럽게 처리됩니다.
+        *   **자동 복구:** 창을 닫았다가 이름을 다시 입력하면 최근 임시저장·제출 답안이 복구됩니다. 선생님이 출제 세트를 바꾸면 학생 화면이 새 시험으로 자동 전환되고, 쓰던 답안은 이전 시험에 보관됩니다.
         
-        *   **태블릿 및 PC 화면 최적화:** 기기별 화면 크기에 맞춰 레이아웃이 찌그러지지 않도록 **'동적 그리드 시스템'**이 적용되어 어떠한 환경에서도 완벽한 가독성을 유지합니다. **나뉜 구문**이 길어지면 아이패드 등 태블릿 화면 폭에 맞춰 알아서 줄바꿈이 적용됩니다.
+        *   **제출 안전장치:** 채점 전에 답안을 먼저 저장합니다. 채점이나 저장에 실패하면 **시도 횟수와 성적이 바뀌지 않으며**, 같은 답안이 두 번 제출되는 일도 막아 줍니다.
+        
+        *   **문제 발생 시 안내 코드:** 화면에 `AI-01`처럼 안내 코드가 함께 표시되면, 화면을 캡처해서 개발자에게 보내 주십시오.
         """)
 
 # ==========================================
@@ -2319,7 +2544,8 @@ elif st.session_state.role == "student":
         guide_text = (
             "🎓 **학생 응시 가이드라인:** 원문장을 읽고, 아래 입력창에서 슬래시(`/`)로 구문을 나누고 성분을 채우십시오.\n\n"
             "🧩 **[스마트 입력창]** 문장이 길어도 자동으로 줄바꿈이 됩니다. 엔터를 쳐도 화면이 튕기지 않으니 편하게 작성하십시오. ✍️\n\n"
-            "👻 **[기호 및 빈칸]** 괄호 `()`, `[]`가 있다면 짝을 정확히 맞추고, 채울 성분이 없는 투명 빈칸은 그대로 비워두고 제출하십시오.\n\n"
+            "✂️ **[구문 나누기]** 슬래시는 띄어쓰기 앞뒤 어디에 쳐도 괜찮지만, **나눈 위치가 정확해야** 정답입니다. 원문의 단어를 지우거나 바꾸면 제출할 수 없습니다.\n\n"
+            "👻 **[기호 및 빈칸]** 괄호 `()`, `[]`는 짝과 위치를 정확히 맞추십시오. 괄호가 틀려도 성분과 해석은 먼저 쓸 수 있지만, **그대로 제출하면 그 문항은 오답**입니다. 채울 성분이 없는 투명 빈칸은 그대로 비워두고 제출하십시오.\n\n"
             "✌️ **[중간저장 활용]** 튕김 방지를 위해 왼쪽 사이드바의 `💾 임시저장` 버튼을 틈틈이 눌러주십시오!"
         )
         if "전체 해석" in active_modes:
@@ -2383,18 +2609,8 @@ elif st.session_state.role == "student":
         for idx, row in active_questions_df.iterrows():
             q_id = row["id"]
 
-            # 💡 수정된 부분: 선생님의 괄호가 포함된 sentence 대신 완벽히 클린한 raw_sentence 사용
-            raw_sentence = str(row.get("raw_sentence", "")).strip()
-
-            # DB 문제로 None이 들어올 경우를 대비한 자동 클린 방어 코드
-            if not raw_sentence or raw_sentence == "None":
-                import re
-
-                raw_sentence = re.sub(r"[()\[\]/]", " ", str(row["sentence"]))
-                raw_sentence = re.sub(r"\s+", " ", raw_sentence).strip()
-                raw_sentence = re.sub(r"\s+([.,?!])", r"\1", raw_sentence)
-
-            q_sentence_clean = raw_sentence
+            # 💡 학생 화면에는 기호가 없는 원문장 사용 (비어 있으면 구문 분석 문장에서 자동 생성)
+            q_sentence_clean = build_clean_sentence(row)
 
             st.markdown(f"#### {idx + 1}. {q_sentence_clean}")
 
@@ -2409,203 +2625,183 @@ elif st.session_state.role == "student":
                 height=100,
             )
 
-            # 💡 [핵심 방어막] 화면 표시 및 검증 로직으로 넘어가기 전, 줄바꿈(\n)을 띄어쓰기로 강제 치환!
-            # 기존 훼손 감지, 채점, 스냅 로직을 단 0.1%의 에러 없이 100% 보존하기 위한 장치
-            if isinstance(student_chunked_raw, str):
-                student_chunked = student_chunked_raw.replace("\n", " ")
-            else:
-                student_chunked = student_chunked_raw
+            # 💡 구문 검사 (제출·채점과 같은 함수). 줄바꿈은 띄어쓰기로 바꿔서 검사함
+            structure = analyze_structure(student_chunked_raw, row)
+            student_chunked = structure["text"]
 
-            # 💡 에러 방지를 위해 덩어리 변수를 미리 빈 리스트로 초기화
-            chunks = []
+            # 💡 제출 이후 슬래시(/) 나누기를 바꿨는지 확인 (바꿨으면 이전 TA 채점 표시는 '수정됨')
+            submitted_chunk = st.session_state.submitted_answers.get(
+                f"chunk_input_{q_id}"
+            )
+            chunk_unchanged = submitted_chunk is None or (
+                str(submitted_chunk).replace("\n", " ").strip()
+                == str(student_chunked).strip()
+            )
 
-            # 💡 [핵심 수정] 초기 상태(학생이 안 건드린 상태)와 채점 상태를 완벽 분리!
-            if student_chunked == q_sentence_clean:
-                # 1. 초기 상태: 원문을 그대로 1개 덩어리로 표시 (에러 팝업 없음, 해석 칸 정상 노출)
-                chunks = [q_sentence_clean]
-            elif student_chunked:
-                import re
+            # ❌ 제출한 답안의 괄호가 틀렸던 경우 (나누기를 고치기 전까지 표시)
+            show_bracket_result = (
+                st.session_state.feedback.get(f"bracket_{q_id}") is False
+                and chunk_unchanged
+            )
+            if show_bracket_result:
+                st.markdown(
+                    "<div class='fb-fail'>❌ 괄호 오류: 제출한 답안의 괄호 위치나 개수가 정확하지 않았습니다.</div>",
+                    unsafe_allow_html=True,
+                )
 
-                # 2. 훼손 검사용 (알파벳, 숫자만 추출하여 띄어쓰기/기호 무시)
-                orig_base = re.sub(r"[^a-zA-Z0-9]", "", q_sentence_clean).lower()
-                stud_base = re.sub(r"[^a-zA-Z0-9]", "", student_chunked).lower()
-
-                if orig_base != stud_base:
+            # 🚨 입력 중 안내 (원문 그대로인 처음 상태와 빈 칸일 때는 표시하지 않음)
+            #    괄호가 틀려도 아래 입력칸은 그대로 보이고, 그대로 제출하면 이 문항만 오답 처리됨
+            if structure["touched"] and not structure["is_empty"]:
+                if not structure["word_ok"]:
                     st.error(
-                        "🚨 문장의 원본 단어가 변경되었습니다! 알파벳이나 숫자를 임의로 지우거나 수정하지 말아주세요. 📝"
+                        "🚨 문장의 원본 단어가 변경되었습니다! 알파벳이나 숫자를 임의로 지우거나 수정하지 마십시오. 단어가 원문과 다르면 제출할 수 없습니다. 📝"
                     )
-                else:
-                    # 3. 괄호 () [] 검사용 (알파벳, 숫자, 괄호 기호만 남겨서 짝패 비교)
-                    teacher_brackets_text = re.sub(
-                        r"[^a-zA-Z0-9\(\)\[\]]", "", str(row["sentence"])
-                    ).lower()
-                    student_brackets_text = re.sub(
-                        r"[^a-zA-Z0-9\(\)\[\]]", "", student_chunked
-                    ).lower()
+                elif show_bracket_result:
+                    pass  # 위의 '괄호 오류' 채점 표시와 같은 내용이므로 한 번만 표시
+                elif structure["balance_msg"]:
+                    st.error(
+                        f"🚨 {structure['balance_msg']} 이대로 제출하면 이 문항은 오답 처리됩니다. 🧐"
+                    )
+                elif not structure["bracket_ok"]:
+                    st.error(
+                        "🚨 괄호 `()`, `[]`의 위치나 개수가 정확하지 않습니다! 묶어야 할 구문 성분을 다시 한번 꼼꼼히 확인해 주십시오. 이대로 제출하면 이 문항은 오답 처리됩니다. 🧐"
+                    )
 
-                    if teacher_brackets_text != student_brackets_text:
-                        st.error(
-                            "🚨 괄호 `()`, `[]`의 위치나 개수가 정확하지 않습니다! 묶어야 할 구문 성분을 다시 한번 꼼꼼히 확인해 주세요. 🧐"
+            # 👉 TA 입력칸 값 준비 (슬래시를 넣거나 빼면 내용이 같은 칸의 태그를 따라 옮겨줌)
+            prepare_ta_inputs(q_id, structure["chunks"])
+            chunks = structure["display_chunks"]
+
+            # 👉 [UI 최적화] 10인치 태블릿 + PC 모두 대응하는 동적 그리드 로직
+            MAX_CHARS_PER_ROW = 50  # 한 줄 최대 글자 수 커트라인
+            MAX_CHUNKS_PER_ROW = 4  # 한 줄 최대 덩어리 개수 커트라인
+
+            rows = []
+            current_row = []
+            current_len = 0
+
+            for original_i, chunk in enumerate(chunks):
+                chunk_len = len(chunk.strip())
+
+                # 현재 줄에 이미 덩어리가 있고, 글자수나 덩어리 개수 한계치를 초과하면 다음 줄로 넘김
+                if current_row and (
+                    current_len + chunk_len > MAX_CHARS_PER_ROW
+                    or len(current_row) >= MAX_CHUNKS_PER_ROW
+                ):
+                    rows.append(current_row)
+                    current_row = [(original_i, chunk)]
+                    current_len = chunk_len
+                else:
+                    current_row.append((original_i, chunk))
+                    current_len += chunk_len
+
+            if current_row:
+                rows.append(current_row)
+
+            # 쪼개진 줄(row) 단위로 화면에 렌더링 (화면 폭 100%를 균등하게 꽉 채움)
+            for row_chunks in rows:
+                cols = st.columns(len(row_chunks))
+                for col_idx, (original_i, chunk) in enumerate(row_chunks):
+                    with cols[col_idx]:
+                        st.markdown(
+                            f"<div class='chunk-box'>{html.escape(chunk.strip())}</div>",
+                            unsafe_allow_html=True,
+                        )
+                        input_key = f"ta_{q_id}_{original_i}"
+                        widget_key = f"input_ta_{q_id}_{original_i}"
+                        default_val = st.session_state.user_inputs.get(input_key, "")
+
+                        if input_key in st.session_state.feedback:
+                            # 💡 제출 때와 같은 값일 때만 채점 결과 표시, 고친 칸은 '수정됨'으로 표시
+                            current_val = (
+                                str(st.session_state.get(widget_key, default_val))
+                                .strip()
+                                .lower()
+                            )
+                            submitted_val = (
+                                str(
+                                    st.session_state.submitted_answers.get(
+                                        input_key, ""
+                                    )
+                                )
+                                .strip()
+                                .lower()
+                            )
+                            feedback_val = st.session_state.feedback[input_key]
+                            if not chunk_unchanged or current_val != submitted_val:
+                                st.markdown(
+                                    "<div class='fb-edit'>✏️ 수정됨</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            elif feedback_val == True:
+                                st.markdown(
+                                    "<div class='fb-pass'>✅ 정답</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            elif feedback_val == "CHUNK_ERROR":
+                                st.markdown(
+                                    "<div class='fb-fail'>✂️ 구문 분석 오류</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.markdown(
+                                    "<div class='fb-fail'>❌ 오답</div>",
+                                    unsafe_allow_html=True,
+                                )
+                        # 💡 값은 prepare_ta_inputs가 미리 넣어 둠 (value를 따로 주지 않음)
+                        val = st.text_input(
+                            "태그 입력",
+                            key=widget_key,
+                            label_visibility="collapsed",
+                        )
+                        local_inputs[input_key] = val
+
+            # 👉 해석 칸은 구문 나누기·괄호 상태와 상관없이 항상 표시 (입력값이 사라지지 않도록)
+            trans_key = f"trans_{q_id}"
+            trans_mode = row.get("trans_mode", "전체 해석")
+
+            # 👉 [추가] 모드에 따른 화면 렌더링 분기 처리
+            if trans_mode != "해석 미출제":
+                default_trans = st.session_state.user_inputs.get(trans_key, "")
+                if trans_key in st.session_state.feedback:
+                    # 💡 제출 때와 같은 해석일 때만 채점 결과 표시, 고쳤으면 '수정됨'
+                    current_trans = str(
+                        st.session_state.get(f"input_trans_{q_id}", default_trans)
+                    ).strip()
+                    submitted_trans = str(
+                        st.session_state.submitted_answers.get(trans_key, "")
+                    ).strip()
+                    if current_trans != submitted_trans:
+                        st.markdown(
+                            "<div class='fb-edit'>✏️ 수정됨</div>",
+                            unsafe_allow_html=True,
+                        )
+                    elif st.session_state.feedback[trans_key] == True:
+                        st.markdown(
+                            "<div class='fb-pass'>✅ 해석 완벽!</div>",
+                            unsafe_allow_html=True,
                         )
                     else:
-                        # 4. 정상 통과 (에러가 없을 때만 슬래시 기준으로 덩어리 나뉨)
-                        def get_core_chunks(text):
-                            t = text.lower()
-                            for c in " ',.:;-()[]?!":
-                                t = t.replace(c, "")
-                            return [x.strip() for x in t.split("/")]
-
-                        if get_core_chunks(student_chunked) == get_core_chunks(
-                            row["sentence"]
-                        ):
-                            student_chunked_clean = row["sentence"]
-                        else:
-                            student_chunked_clean = student_chunked
-
-                        chunks = student_chunked_clean.split("/")
-
-            # 💡 chunks 리스트가 성공적으로 생성되었을 때만 화면 렌더링
-            if len(chunks) > 0:
-                # 💡 제출 이후 슬래시(/) 나누기를 바꿨는지 확인 (바꿨으면 이전 TA 채점 표시는 '수정됨')
-                submitted_chunk = st.session_state.submitted_answers.get(
-                    f"chunk_input_{q_id}"
+                        st.markdown(
+                            "<div class='fb-fail'>❌ 해석 오답</div>",
+                            unsafe_allow_html=True,
+                        )
+                label_text = (
+                    "✍️ 핵심적인 내용과 의미만 간략히 적어주십시오."
+                    if trans_mode == "핵심구 해석"
+                    else "✍️ 문장 전체 해석을 적어주십시오."
                 )
-                chunk_unchanged = submitted_chunk is None or (
-                    str(submitted_chunk).replace("\n", " ").strip()
-                    == str(student_chunked).strip()
-                )
-                # 👉 [UI 최적화] 10인치 태블릿 + PC 모두 대응하는 동적 그리드 로직
-                MAX_CHARS_PER_ROW = 50  # 한 줄 최대 글자 수 커트라인
-                MAX_CHUNKS_PER_ROW = 4  # 한 줄 최대 덩어리 개수 커트라인
 
-                rows = []
-                current_row = []
-                current_len = 0
-
-                for original_i, chunk in enumerate(chunks):
-                    chunk_len = len(chunk.strip())
-
-                    # 현재 줄에 이미 덩어리가 있고, 글자수나 덩어리 개수 한계치를 초과하면 다음 줄로 넘김
-                    if current_row and (
-                        current_len + chunk_len > MAX_CHARS_PER_ROW
-                        or len(current_row) >= MAX_CHUNKS_PER_ROW
-                    ):
-                        rows.append(current_row)
-                        current_row = [(original_i, chunk)]
-                        current_len = chunk_len
-                    else:
-                        current_row.append((original_i, chunk))
-                        current_len += chunk_len
-
-                if current_row:
-                    rows.append(current_row)
-
-                # 쪼개진 줄(row) 단위로 화면에 렌더링 (화면 폭 100%를 균등하게 꽉 채움)
-                for row_chunks in rows:
-                    cols = st.columns(len(row_chunks))
-                    for col_idx, (original_i, chunk) in enumerate(row_chunks):
-                        with cols[col_idx]:
-                            st.markdown(
-                                f"<div class='chunk-box'>{chunk.strip()}</div>",
-                                unsafe_allow_html=True,
-                            )
-                            input_key = f"ta_{q_id}_{original_i}"
-                            widget_key = f"input_ta_{q_id}_{original_i}"
-                            default_val = st.session_state.user_inputs.get(
-                                input_key, ""
-                            )
-
-                            if input_key in st.session_state.feedback:
-                                # 💡 제출 때와 같은 값일 때만 채점 결과 표시, 고친 칸은 '수정됨'으로 표시
-                                current_val = (
-                                    str(st.session_state.get(widget_key, default_val))
-                                    .strip()
-                                    .lower()
-                                )
-                                submitted_val = (
-                                    str(
-                                        st.session_state.submitted_answers.get(
-                                            input_key, ""
-                                        )
-                                    )
-                                    .strip()
-                                    .lower()
-                                )
-                                feedback_val = st.session_state.feedback[input_key]
-                                if not chunk_unchanged or current_val != submitted_val:
-                                    st.markdown(
-                                        "<div class='fb-edit'>✏️ 수정됨</div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                elif feedback_val == True:
-                                    st.markdown(
-                                        "<div class='fb-pass'>✅ 정답</div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                elif feedback_val == "CHUNK_ERROR":
-                                    st.markdown(
-                                        "<div class='fb-fail'>✂️ 구문 분석 오류</div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                else:
-                                    st.markdown(
-                                        "<div class='fb-fail'>❌ 오답</div>",
-                                        unsafe_allow_html=True,
-                                    )
-                            val = st.text_input(
-                                "태그 입력",
-                                value=default_val,
-                                key=f"input_ta_{q_id}_{original_i}",
-                                label_visibility="collapsed",
-                            )
-                            local_inputs[input_key] = val
-
-                trans_key = f"trans_{q_id}"
-                trans_mode = row.get("trans_mode", "전체 해석")
-
-                # 👉 [추가] 모드에 따른 화면 렌더링 분기 처리
-                if trans_mode != "해석 미출제":
-                    default_trans = st.session_state.user_inputs.get(trans_key, "")
-                    if trans_key in st.session_state.feedback:
-                        # 💡 제출 때와 같은 해석일 때만 채점 결과 표시, 고쳤으면 '수정됨'
-                        current_trans = str(
-                            st.session_state.get(f"input_trans_{q_id}", default_trans)
-                        ).strip()
-                        submitted_trans = str(
-                            st.session_state.submitted_answers.get(trans_key, "")
-                        ).strip()
-                        if current_trans != submitted_trans:
-                            st.markdown(
-                                "<div class='fb-edit'>✏️ 수정됨</div>",
-                                unsafe_allow_html=True,
-                            )
-                        elif st.session_state.feedback[trans_key] == True:
-                            st.markdown(
-                                "<div class='fb-pass'>✅ 해석 완벽!</div>",
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.markdown(
-                                "<div class='fb-fail'>❌ 해석 오답</div>",
-                                unsafe_allow_html=True,
-                            )
-                    label_text = (
-                        "✍️ 핵심적인 내용과 의미만 간략히 적어주십시오."
+                trans_val = st.text_input(
+                    label_text,
+                    value=default_trans,
+                    key=f"input_trans_{q_id}",
+                    help=(
+                        "누가 + 어쩐다 + 무엇을만 들어가면 짧게 써도 됩니다! (\\~않다는 꼭 넣기)"
                         if trans_mode == "핵심구 해석"
-                        else "✍️ 문장 전체 해석을 적어주십시오."
-                    )
-
-                    trans_val = st.text_input(
-                        label_text,
-                        value=default_trans,
-                        key=f"input_trans_{q_id}",
-                        help=(
-                            "누가 + 어쩐다 + 무엇을만 들어가면 짧게 써도 됩니다! (\\~않다는 꼭 넣기)"
-                            if trans_mode == "핵심구 해석"
-                            else None
-                        ),
-                    )
-                    local_inputs[trans_key] = trans_val
+                        else None
+                    ),
+                )
+                local_inputs[trans_key] = trans_val
 
             st.divider()
 
@@ -2621,40 +2817,19 @@ elif st.session_state.role == "student":
             type="primary",
             disabled=submit_disabled,
         ):
-            is_altered = False
+            # 🛡️ 단어가 원문과 달라진 문항이 있으면 제출하지 않음 (괄호 오류는 제출되고 그 문항만 오답 처리)
+            altered_numbers = []
+            for idx, row in active_questions_df.iterrows():
+                structure = analyze_structure(
+                    st.session_state.get(f"chunk_input_{row['id']}", ""), row
+                )
+                # 빈 칸은 예전처럼 막지 않음 (구문 분석 오류로 채점됨)
+                if not structure["is_empty"] and not structure["word_ok"]:
+                    altered_numbers.append(f"{idx + 1}번")
 
-            for _, row in active_questions_df.iterrows():
-                q_id = row["id"]
-                raw_sentence = str(row.get("raw_sentence", "")).strip()
-
-                # DB 문제로 None이 들어올 경우를 대비한 자동 클린 방어 코드 (제출 시에도 적용)
-                if not raw_sentence or raw_sentence == "None":
-                    import re
-
-                    raw_sentence = re.sub(r"[()\[\]/]", " ", str(row["sentence"]))
-                    raw_sentence = re.sub(r"\s+", " ", raw_sentence).strip()
-                    raw_sentence = re.sub(r"\s+([.,?!])", r"\1", raw_sentence)
-
-                # 👉 [수정] 제출 및 훼손 검증 로직에서도 줄바꿈(\n)을 띄어쓰기로 치환하여 기존 로직 100% 보호
-                student_chunked_now = st.session_state.get(f"chunk_input_{q_id}", "")
-                if isinstance(student_chunked_now, str):
-                    student_chunked_now = student_chunked_now.replace("\n", " ")
-
-                if not student_chunked_now:
-                    continue  # 미입력 상태면 방어막 패스 (어차피 빈칸 오답 처리됨)
-
-                import re
-
-                orig_base = re.sub(r"[^a-zA-Z0-9]", "", raw_sentence).lower()
-                stud_base = re.sub(r"[^a-zA-Z0-9]", "", student_chunked_now).lower()
-
-                if orig_base != stud_base:
-                    is_altered = True
-                    break
-
-            if is_altered:
+            if altered_numbers:
                 st.error(
-                    "🚨 문장의 원본 단어가 훼손된 곳이 있습니다! 다시 한번 꼼꼼히 확인한 후 제출해 주세요. 📝"
+                    f"🚨 {', '.join(altered_numbers)} 문항의 원본 단어가 변경되었습니다! 알파벳이나 숫자를 원문과 똑같이 고친 후 다시 제출해 주십시오. (시도 횟수는 차감되지 않았습니다) 📝"
                 )
                 st.stop()
 
