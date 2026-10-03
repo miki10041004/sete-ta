@@ -43,6 +43,9 @@ if _fallback_setting.lower() in ("off", "none") or _fallback_setting == GEMINI_M
 else:
     GEMINI_FALLBACK_MODEL = _fallback_setting
 
+# 🔑 선생님 암호: 코드에 적지 않고 Secrets의 TEACHER_PASSWORD에서 읽음 (없으면 선생님 로그인 차단 → 점검 코드 PW-01)
+TEACHER_PASSWORD = _read_secret("TEACHER_PASSWORD")
+
 
 @st.cache_resource(show_spinner=False)
 def get_ai_client(api_key):
@@ -133,7 +136,46 @@ class TranslationVerdict(BaseModel):
 
 
 class GradingError(Exception):
-    """AI 채점을 끝내 완료하지 못했을 때 사용 (학생 제출은 취소되고 시도 횟수는 차감되지 않음)"""
+    """AI 채점을 끝내 완료하지 못했을 때 사용 (학생 제출은 취소되고 시도 횟수는 차감되지 않음)
+    check_code: 점검 코드(AI-01~05), detail: 짧은 표시(오류 번호 등, 예: "402")"""
+
+    def __init__(self, message, check_code="AI-02", detail=""):
+        super().__init__(message)
+        self.check_code = check_code
+        self.detail = detail
+
+
+# 여러 번 시도한 결과가 서로 다르면 근본 원인에 가까운 것을 대표로 (결제 > 키 > 모델·설정 > 일시 장애)
+_AI_CODE_PRIORITY = {"AI-03": 4, "AI-04": 3, "AI-05": 2, "AI-02": 1}
+
+
+def classify_ai_error(error):
+    """AI 호출 오류 → (점검 코드, 짧은 표시)
+    AI-02 일시 장애(5xx·408·429·시간 초과·연결·응답 형식) / AI-03 선불 잔액 소진(402)
+    AI-04 키·권한(401·403·키 오류인 400) / AI-05 모델·요청 설정(404·그 외 4xx)"""
+    if isinstance(error, genai_errors.ClientError):
+        code = getattr(error, "code", None)
+        label = str(code) if code else "4xx"
+        text = str(error)
+        if code == 402:
+            return "AI-03", label
+        if code in (401, 403) or (
+            code == 400 and ("API_KEY_INVALID" in text or "API key not valid" in text)
+        ):
+            return "AI-04", label
+        if code in (408, 429):
+            return "AI-02", label
+        return "AI-05", label
+    if isinstance(error, genai_errors.ServerError):
+        code = getattr(error, "code", None)
+        return "AI-02", str(code) if code else "5xx"
+    if isinstance(
+        error, ValueError
+    ):  # 응답이 비었거나 JSON 형식이 깨짐 (_parse_verdicts)
+        return "AI-02", "응답"
+    if "timeout" in type(error).__name__.lower():
+        return "AI-02", "시간초과"
+    return "AI-02", "연결"
 
 
 def _build_attempt_plan():
@@ -154,7 +196,9 @@ def strip_analysis_marks(sentence):
     # 구문 분석 문장에서 기호(/, (), [])를 지워 학생용 '기호 없는 원문장'을 만듦
     clean = re.sub(r"[()\[\]/]", " ", str(sentence))
     clean = re.sub(r"\s+", " ", clean).strip()
-    return re.sub(r"\s+([.,?!])", r"\1", clean)
+    return re.sub(
+        r"\s+([.,?!;:])", r"\1", clean
+    )  # 문장부호 앞 공백 정리 (세미콜론·콜론 포함)
 
 
 def build_clean_sentence(row):
@@ -203,7 +247,7 @@ def grade_translations_batch(items):
     """items: [{"id", "mode", "original", "reference", "student", "note"}, ...]
     반환: ({id: (정답여부, 판정사유)}, 실제 채점한 모델명) / 끝내 실패하면 GradingError 발생"""
     if ai_client is None:
-        raise GradingError("AI 키 미설정")
+        raise GradingError("AI 키 미설정", "AI-01")
 
     payload = []
     for it in items:
@@ -234,7 +278,7 @@ def grade_translations_batch(items):
         max_output_tokens=8192,
     )
 
-    last_error = "알 수 없는 오류"
+    errors = []  # 시도마다 (점검 코드, 짧은 표시)
     skip_model = None  # 재시도해도 소용없는 오류가 난 모델은 남은 순서에서 건너뜀
     attempted = False
     for model_name, wait_sec in _build_attempt_plan():
@@ -248,19 +292,86 @@ def grade_translations_batch(items):
                 model=model_name, contents=contents, config=config
             )
             return _parse_verdicts(response.text, expected_ids), model_name
-        except genai_errors.ClientError as e:
-            code = getattr(e, "code", None)
-            last_error = f"{model_name} 요청 오류 {code}"
-            print(f"[AI 채점] {last_error}: {e}")
-            if code not in (408, 429):
-                skip_model = model_name  # 키·모델명 등 설정 문제 → 같은 모델 재시도 없이 다음 모델로
-        except genai_errors.ServerError as e:
-            last_error = f"{model_name} 서버 오류 {getattr(e, 'code', '')}"
-            print(f"[AI 채점] {last_error}: {e}")
         except Exception as e:
-            last_error = f"{model_name} {type(e).__name__}: {e}"[:100]
-            print(f"[AI 채점] {last_error}")
-    raise GradingError(last_error)
+            check_code, detail = classify_ai_error(e)
+            errors.append((check_code, detail))
+            print(
+                f"[AI 채점] {model_name} 실패 (점검 코드: {check_code}·{detail}): {type(e).__name__}: {e}"[
+                    :400
+                ]
+            )
+            if isinstance(e, genai_errors.ClientError) and getattr(
+                e, "code", None
+            ) not in (408, 429):
+                skip_model = model_name  # 키·모델명 등 설정 문제 → 같은 모델 재시도 없이 다음 모델로
+            if check_code == "AI-03" or (check_code == "AI-04" and detail != "403"):
+                break  # 잔액 소진·잘못된 키는 예비 모델도 같은 계정·키라 소용없음 → 바로 중단
+    # 대표 원인 고르기 (같은 순위면 나중 시도 기준)
+    check_code, detail = max(
+        reversed(errors),
+        key=lambda x: _AI_CODE_PRIORITY[x[0]],
+        default=("AI-02", "연결"),
+    )
+    raise GradingError(f"{check_code}·{detail}", check_code, detail)
+
+
+def _tag_parts(tag_text):
+    # 성분 칸 글자를 성분 집합으로 나눔: 대소문자·띄어쓰기 무시, 괄호 ( )와 세로선 |은 구분 기호
+    # 성분 끝의 마침표도 무시 (가운데 마침표는 그대로: "M.V." = "m.v", "mv"는 다름)
+    # 예: "Vt ( adv )" → {"vt", "adv"}, "adv|Vt" → {"adv", "vt"}
+    text = str(tag_text or "").lower().replace(" ", "")
+    for sep in (")", "|"):
+        text = text.replace(sep, "(")
+    parts = (p.rstrip(".") for p in text.split("("))
+    return set(p for p in parts if p)
+
+
+# [F12] 연결어 도형: △ = 관계사, □ = 접속사
+SHAPES = ("△", "□")
+SHAPE_LABELS = {"△": "△ 관계사", "□": "□ 접속사"}
+# 도형 버튼을 띄우는 후보 단어 (정답표가 아님 — 나눈 칸이 이 중 한 단어뿐이면 정답과 상관없이 버튼 표시)
+CONNECTOR_WORDS = frozenset(
+    "that who whom whose which where when why how what whether if and or but "
+    "although though because while as than after before since until unless so once".split()
+)
+
+
+def connector_candidate(chunk):
+    # [F12] 도형 버튼 후보 칸: 알파벳·숫자 묶음이 하나뿐이고 후보 단어 (괄호·문장부호 무시: "(that" → 후보)
+    words = re.findall(r"[A-Za-z0-9]+", str(chunk or ""))
+    return len(words) == 1 and words[0].lower() in CONNECTOR_WORDS
+
+
+def shape_set_names(questions):
+    # [F12] 도형(△·□)이 적힌 문항이 하나라도 있는 세트 이름 → 그 세트 전체 문항에 도형 버튼
+    return {
+        _safe_text(q.get("set_name")) or "기본 세트"
+        for q in questions
+        if any(s in _safe_text(q.get("answer_ta")) for s in SHAPES)
+    }
+
+
+def shapes_enabled(row, shape_sets):
+    return (_safe_text(row.get("set_name")) or "기본 세트") in shape_sets
+
+
+def split_shape(tag_text):
+    # [F12] TA 글자 → (도형 집합, 도형을 뺀 성분 글자). 예: "△(S)" → ({"△"}, "(S)")
+    text = str(tag_text or "")
+    found = {s for s in SHAPES if s in text}
+    for s in SHAPES:
+        text = text.replace(s, "")
+    return found, text
+
+
+def combine_shape_ta(shape, ta):
+    # [F12] 출제란 도형 버튼 + 칸 TA → 저장용 글자 ("△"+"" → "△", "△"+"S" → "△(S)", "□"+"(adj)(Vt)" → "□(adj)(Vt)")
+    ta = str(ta or "").strip()
+    if shape not in SHAPES:
+        return ta
+    if not ta:
+        return shape
+    return shape + ta if ta.startswith("(") else f"{shape}({ta})"
 
 
 def grade_submission(active_questions_df, local_inputs, chunk_inputs):
@@ -271,9 +382,11 @@ def grade_submission(active_questions_df, local_inputs, chunk_inputs):
     question_states = []  # [q_id, 해당 문항 오답 여부]
     ai_items = []
     ai_id_map = {}
+    shape_sets = shape_set_names(active_questions_df.to_dict("records"))
 
     for _, row in active_questions_df.iterrows():
         q_id = row["id"]
+        shapes_on = shapes_enabled(row, shape_sets)
         ta_answers = [
             t.strip().lower() for t in _safe_text(row.get("answer_ta")).split("/")
         ]
@@ -312,18 +425,30 @@ def grade_submission(active_questions_df, local_inputs, chunk_inputs):
                 continue
             correct_ta = ta_answers[teacher_idx]
 
-            # 💡 복수 정답(괄호) 집합(Set) 분리 및 공백 완벽 제거 로직
-            correct_ta_clean = correct_ta.replace(" ", "")
-            student_ans_clean = student_ans.replace(" ", "")
+            # 🔺 연결어 도형: 정답 도형과 정확히 같아야 함 (세로선은 성분에만 적용)
+            #    학생 도형은 버튼으로만 인정 (TA 칸에 친 기호는 무시), 버튼이 보이는 칸에서만 반영
+            teacher_shapes, correct_ta = split_shape(correct_ta)
+            student_shape = ""
+            if shapes_on and connector_candidate(structure["chunks"][i]):
+                student_shape = str(local_inputs.get(f"shape_{q_id}_{i}", "") or "")
+                if student_shape not in SHAPES:
+                    student_shape = ""
+                answers_dict[f"shape_{q_id}_{i}"] = student_shape
+            if teacher_shapes != ({student_shape} if student_shape else set()):
+                feedback_dict[input_key] = False
+                is_question_wrong = True
+                continue
 
-            teacher_opts = set(
-                p for p in correct_ta_clean.replace(")", "(").split("(") if p
-            )
-            student_opts = set(
-                p for p in student_ans_clean.replace(")", "(").split("(") if p
-            )
+            # 💡 복수 성분: 괄호로 묶은 칸은 모두 써야 정답, 세로선(|)으로 나눈 칸은 하나 이상 쓰면 정답
+            #    (대소문자·순서·띄어쓰기 무관, 정답에 없는 성분을 섞으면 오답)
+            teacher_opts = _tag_parts(correct_ta)
+            student_opts = _tag_parts(split_shape(student_ans)[1])
+            any_one_ok = "|" in correct_ta
 
-            if not teacher_opts:  # 선생님이 정답 칸을 비워둔 경우
+            if teacher_shapes and not student_opts:
+                # 🔺 도형 칸은 성분을 비워도 도형만 맞으면 정답 (성분을 쓰면 그 성분도 맞아야 함)
+                feedback_dict[input_key] = True
+            elif not teacher_opts:  # 선생님이 정답 칸을 비워둔 경우
                 if student_opts:  # 학생이 빈칸에 무언가 적었다면 오답 처리
                     feedback_dict[input_key] = False
                     is_question_wrong = True
@@ -334,7 +459,11 @@ def grade_submission(active_questions_df, local_inputs, chunk_inputs):
                     feedback_dict[input_key] = False
                     is_question_wrong = True
                 else:
-                    if student_opts.issubset(teacher_opts):
+                    if (
+                        student_opts.issubset(teacher_opts)
+                        if any_one_ok
+                        else student_opts == teacher_opts
+                    ):
                         feedback_dict[input_key] = True
                     else:
                         feedback_dict[input_key] = False
@@ -392,34 +521,12 @@ def grade_submission(active_questions_df, local_inputs, chunk_inputs):
 
 
 # ==========================================
-# [데이터 가공 로직] - 태그 정리 및 마침표 추가
+# [데이터 가공 로직] - 구문 분석 문장 끝 마침표 (TA 정답은 선생님이 입력한 그대로 저장)
 # ==========================================
-def clean_tag_string(ta_str):
-    if pd.isna(ta_str):
-        return ""
-    chunks = str(ta_str).split("/")
-    new_chunks = []
-    for c in chunks:
-        c = c.strip()
-        if c.lower() in ["(every)", "(often)"]:
-            new_chunks.append("[Adv]")
-        elif c.startswith("(") and c.endswith(")"):
-            new_chunks.append("(Prep)")
-        elif c == "[have]":
-            new_chunks.append("M.V.")
-        elif c == "[to]":
-            new_chunks.append("(Prep)")
-        elif c.lower() == "[adv]":
-            new_chunks.append("[Adv]")
-        else:
-            c = c.replace("[", "").replace("]", "")
-            new_chunks.append(c)
-    return " / ".join(new_chunks)
-
-
 def ensure_period(sentence):
+    # 끝이 . ? ! 이면(뒤에 닫는 괄호·따옴표가 붙어도) 그대로 두고, 그 외에만 마침표를 붙임
     s = str(sentence).strip()
-    if s and not s.endswith("."):
+    if s and not re.search(r"[.?!][)\]\"'”’]*$", s):
         s += "."
     return s
 
@@ -482,6 +589,223 @@ def brackets_match(student_text, teacher_sentence):
     return re.fullmatch("".join(pattern), student) is not None
 
 
+# ------------------------------------------
+# [F7-2] 괄호 예외: 선생님이 고른 괄호만 '안 쳐도 정답(생략)'·'쪼개도 정답(단어 사이)'
+#  - 저장: questions.bracket_rules = "2o,3s" (여는 괄호 순서 번호 + o 생략 / s 쪼개기), 빈 값 = 예외 없음
+#  - 예외가 없는 문항은 brackets_match 그대로 (예전과 완전히 같음)
+#  - 쪼개기는 안에 다른 괄호가 없고 두 단어 이상인 괄호만 (괄호 안 괄호를 쪼개면 어느 괄호가 닫히는지 모호해짐)
+# ------------------------------------------
+BRACKET_OMIT, BRACKET_SPLIT = "o", "s"
+BRACKET_MAX_OMIT = 10  # '안 쳐도 정답' 괄호 수 상한 (경우의 수 2^n)
+BRACKET_NUMBERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
+
+def bracket_pairs(sentence):
+    # 여는 괄호 순서대로 [(종류 "(" 또는 "[", 여는 위치, 닫는 위치)]. 괄호 짝이 맞지 않으면 []
+    sentence = _safe_text(sentence)
+    if bracket_balance_message(sentence):
+        return []
+    pairs, stack = [], []
+    for pos, ch in enumerate(sentence):
+        if ch in "([":
+            stack.append(len(pairs))
+            pairs.append([ch, pos, None])
+        elif ch in ")]":
+            pairs[stack.pop()][2] = pos
+    return [tuple(p) for p in pairs]
+
+
+def bracket_splittable(sentence, pair):
+    # '쪼개도 정답'을 고를 수 있는 괄호: 안에 다른 괄호가 없고 단어(알파벳·숫자 묶음)가 2개 이상
+    inner = _safe_text(sentence)[pair[1] + 1 : pair[2]]
+    return (
+        not re.search(r"[\(\)\[\]]", inner)
+        and len(re.findall(r"[a-zA-Z0-9]+", inner)) >= 2
+    )
+
+
+def parse_bracket_rules(text):
+    # "2o,3os" → ({1: {"o"}, 2: {"o", "s"}}, 형식이 틀린 조각 목록)  (괄호 번호는 0부터)
+    rules, bad = {}, []
+    for token in re.split(r"[,\s]+", _safe_text(text)):
+        if not token:
+            continue
+        m = re.fullmatch(r"([0-9]+)([os]+)", token.lower())
+        if not m or int(m.group(1)) < 1:
+            bad.append(token)
+            continue
+        rules.setdefault(int(m.group(1)) - 1, set()).update(m.group(2))
+    return rules, bad
+
+
+def format_bracket_rules(rules):
+    # {1: {"o"}, 2: {"s", "o"}} → "2o,3os" (번호 순, 생략 먼저)
+    return ",".join(
+        f"{i + 1}" + "".join(f for f in (BRACKET_OMIT, BRACKET_SPLIT) if f in flags)
+        for i, flags in sorted(rules.items())
+        if flags
+    )
+
+
+def valid_bracket_rules(sentence, text):
+    # 채점·화면용: 이 문장의 괄호에 맞는 예외만 남김 (맞지 않는 조각은 무시, 출제 데이터 검사에서 따로 안내)
+    pairs = bracket_pairs(sentence)
+    valid = {}
+    for i, flags in parse_bracket_rules(text)[0].items():
+        if i < len(pairs):
+            keep = {
+                f
+                for f in flags
+                if f == BRACKET_OMIT or bracket_splittable(sentence, pairs[i])
+            }
+            if keep:
+                valid[i] = keep
+    if sum(BRACKET_OMIT in f for f in valid.values()) > BRACKET_MAX_OMIT:
+        valid = {i: f - {BRACKET_OMIT} for i, f in valid.items() if f - {BRACKET_OMIT}}
+    return valid
+
+
+def bracket_rule_problems(sentence, text):
+    # 출제 데이터 검사용: 이 문장에 맞지 않는 괄호 예외 안내 목록 ([] = 이상 없음)
+    rules, bad = parse_bracket_rules(text)
+    if not rules and not bad:
+        return []
+    pairs = bracket_pairs(sentence)
+    problems = []
+    if bad:
+        problems.append(f"괄호 예외 형식이 올바르지 않습니다. ({', '.join(bad)})")
+    missing = [str(i + 1) for i in sorted(rules) if i >= len(pairs)]
+    if missing:
+        problems.append(
+            f"괄호 예외에 없는 괄호 번호가 있습니다. ({', '.join(missing)}번째 괄호, 구문 분석 문장의 괄호 {len(pairs)}쌍)"
+        )
+    no_split = [
+        str(i + 1)
+        for i, f in sorted(rules.items())
+        if BRACKET_SPLIT in f
+        and i < len(pairs)
+        and not bracket_splittable(sentence, pairs[i])
+    ]
+    if no_split:
+        problems.append(
+            f"'쪼개도 정답'은 안에 다른 괄호가 없고 두 단어 이상인 괄호에만 쓸 수 있습니다. ({', '.join(no_split)}번째 괄호)"
+        )
+    if sum(BRACKET_OMIT in f for f in rules.values()) > BRACKET_MAX_OMIT:
+        problems.append(
+            f"'안 쳐도 정답' 괄호는 한 문항에 {BRACKET_MAX_OMIT}개까지 고를 수 있습니다."
+        )
+    return problems
+
+
+def remap_bracket_rules(text, old_sentence, new_sentence):
+    # DB 관리 탭에서 구문 분석 문장을 고쳤을 때: 괄호 종류 순서가 같으면 번호 기준으로 유지
+    #  (맞지 않게 된 쪼개기만 해제), 달라지면 그 문항의 괄호 예외 전체 해제
+    if not _safe_text(text) or _safe_text(old_sentence) == _safe_text(new_sentence):
+        return _safe_text(text)
+    old_kinds = [p[0] for p in bracket_pairs(old_sentence)]
+    new_kinds = [p[0] for p in bracket_pairs(new_sentence)]
+    if old_kinds != new_kinds:
+        return ""
+    return format_bracket_rules(valid_bracket_rules(new_sentence, text))
+
+
+def bracket_label(sentence, index, pair):
+    # 괄호 버튼 이름: "② (around stars (…))" — 안쪽 괄호는 (…)로 접고, 5단어 이상이면 앞 3단어 … 끝 단어
+    sentence = _safe_text(sentence)
+    kind, start, end = pair
+    depth, body = 0, ""
+    for ch in sentence[start + 1 : end]:
+        if ch in "([":
+            if depth == 0:
+                body += " " + ch + "…"
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth == 0:
+                body += ch + " "
+        elif depth == 0:
+            body += ch
+    words = body.replace("/", " ").split()
+    if len(words) > 4:
+        words = words[:3] + ["…", words[-1]]
+    number = BRACKET_NUMBERS[index] if index < len(BRACKET_NUMBERS) else f"{index + 1}."
+    return f"{number} {kind}{' '.join(words)}{')' if kind == '(' else ']'}"
+
+
+def bracket_rules_summary(sentence, text):
+    # DB 관리 표 '괄호 예외' 칸: "② 생략·쪼개기, ③ 생략" (예외 없으면 빈칸)
+    names = {BRACKET_OMIT: "생략", BRACKET_SPLIT: "쪼개기"}
+    parts = []
+    for i, flags in sorted(valid_bracket_rules(sentence, text).items()):
+        number = BRACKET_NUMBERS[i] if i < len(BRACKET_NUMBERS) else f"{i + 1}."
+        parts.append(
+            number
+            + " "
+            + "·".join(names[f] for f in (BRACKET_OMIT, BRACKET_SPLIT) if f in flags)
+        )
+    return ", ".join(parts)
+
+
+def brackets_match_rules(student_text, teacher_sentence, rules_text):
+    # [F7-2] 괄호 예외까지 반영한 괄호 위치 비교 (예외가 없으면 brackets_match와 같음)
+    if brackets_match(student_text, teacher_sentence):
+        return True
+    rules = valid_bracket_rules(teacher_sentence, rules_text)
+    if not rules:
+        return False
+    # 선생님 문장 토큰: (글자 또는 괄호, 괄호 번호(글자는 None), 바로 앞에 띄어쓰기·문장부호가 있었는지)
+    tokens, stack, opened, gap = [], [], 0, False
+    for ch in str(teacher_sentence):
+        if re.fullmatch(r"[a-zA-Z0-9]", ch):
+            tokens.append((ch.lower(), None, gap))
+        elif ch in "([":
+            stack.append(opened)
+            tokens.append((ch, opened, gap))
+            opened += 1
+        elif ch in ")]":
+            tokens.append((ch, stack.pop(), gap))
+        else:
+            gap = True
+            continue
+        gap = False
+    student = _bracket_skeleton(student_text)
+    # 합치기: 원래 문장에서 바로 붙어 있던 ')(' / ']['만 (괄호를 빼서 새로 붙은 곳은 아님)
+    merge_at = {
+        i
+        for i in range(len(tokens) - 1)
+        if tokens[i][0] + tokens[i + 1][0] in (")(", "][")
+    }
+    # 쪼개기: 그 괄호 바로 안의 단어 사이 (글자와 글자 사이에 띄어쓰기·문장부호가 있던 곳)
+    split_at = {}
+    for k, flags in rules.items():
+        if BRACKET_SPLIT in flags:
+            ends = [i for i, tok in enumerate(tokens) if tok[1] == k]
+            close_open = ")(" if tokens[ends[0]][0] == "(" else "]["
+            for i in range(ends[0] + 2, ends[1]):
+                if tokens[i][2] and tokens[i - 1][1] is None and tokens[i][1] is None:
+                    split_at[i] = (close_open, k)
+    omit = [k for k, flags in sorted(rules.items()) if BRACKET_OMIT in flags]
+    for mask in range(1 << len(omit)):
+        drop = {k for j, k in enumerate(omit) if mask >> j & 1}
+        pattern, i = [], 0
+        while i < len(tokens):
+            ch, k = tokens[i][0], tokens[i][1]
+            if k is not None and k in drop:
+                i += 1
+                continue
+            if i in split_at and split_at[i][1] not in drop:
+                pattern.append("(?:" + re.escape(split_at[i][0]) + ")?")
+            if i in merge_at and tokens[i + 1][1] not in drop:
+                pattern.append("(?:" + re.escape(ch + tokens[i + 1][0]) + ")?")
+                i += 2
+                continue
+            pattern.append(re.escape(ch))
+            i += 1
+        if re.fullmatch("".join(pattern), student):
+            return True
+    return False
+
+
 def chunk_spans(chunks):
     # 칸마다 원문의 알파벳·숫자 기준 (시작, 끝) 위치
     spans, pos = [], 0
@@ -490,6 +814,22 @@ def chunk_spans(chunks):
         spans.append((pos, pos + length))
         pos += length
     return spans
+
+
+def merge_blank_chunks(chunks):
+    # [F13] 알파벳·숫자가 없는 칸(맨 앞·맨 끝 슬래시, 연달아 친 //, 문장부호·괄호만 떼어 낸 칸)은
+    #  칸으로 치지 않고 옆 칸에 붙임 → 맨 앞 빈 칸은 다음 칸에, 그 외는 앞 칸에 (슬래시만 빠지고 글자는 그대로)
+    #  모든 칸에 알파벳·숫자가 없으면(빈 입력 등) 한 칸으로 합침
+    merged, pending = [], ""
+    for chunk in chunks:
+        if _alnum(chunk):
+            merged.append(pending + chunk)
+            pending = ""
+        elif merged:
+            merged[-1] += chunk
+        else:
+            pending += chunk
+    return merged if merged else [pending]
 
 
 def analyze_structure(student_text, row):
@@ -504,9 +844,14 @@ def analyze_structure(student_text, row):
     teacher = _safe_text(row.get("sentence"))
     chunks = text.split("/")
     teacher_chunks = teacher.split("/")
+    # [F13] 학생이 실수로 만든 빈 칸은 무시 (선생님 문장에 빈 칸이 있는 예전 문항은 예전 동작 그대로)
+    if all(_alnum(c) for c in teacher_chunks):
+        chunks = merge_blank_chunks(chunks)
 
     balance_msg = bracket_balance_message(text)
-    bracket_ok = not balance_msg and brackets_match(text, teacher)
+    bracket_ok = not balance_msg and brackets_match_rules(
+        text, teacher, row.get("bracket_rules")
+    )
 
     # 칸의 시작·끝 위치가 정답 칸과 똑같을 때만 '잘 나눈 칸'
     teacher_by_span = {}
@@ -538,6 +883,103 @@ def analyze_structure(student_text, row):
         "matched": matched,
         "all_matched": all_matched,
     }
+
+
+def _first_word_diff(raw, sentence):
+    # 원문장과 구문 분석 문장에서 처음 달라지는 단어를 찾아 안내 문구로 (검사 안내용)
+    raw_words = re.findall(r"[a-z0-9]+", str(raw).lower())
+    sentence_words = re.findall(r"[a-z0-9]+", str(sentence).lower())
+    for raw_word, sentence_word in zip(raw_words, sentence_words):
+        if raw_word != sentence_word:
+            return f"(처음 달라지는 곳: 원문장 '{raw_word}' ↔ 구문 분석 문장 '{sentence_word}')"
+    if len(raw_words) > len(sentence_words):
+        return f"(원문장 쪽에 '{raw_words[len(sentence_words)]}'부터 더 있습니다)"
+    if len(sentence_words) > len(raw_words):
+        return (
+            f"(구문 분석 문장 쪽에 '{sentence_words[len(raw_words)]}'부터 더 있습니다)"
+        )
+    return ""
+
+
+def check_question_data(raw, sentence, ta, bracket_rules=""):
+    """[출제 데이터 검사] 문제 출제 탭 추가·DB 관리 탭 저장 공용
+    - 이대로 저장되면 학생이 그 문항을 맞힐 수 없는 경우를 찾아 안내 문구 목록으로 돌려줌 ([] = 이상 없음)
+    - 원문장이 비어 있으면 구문 분석 문장에서 자동으로 만들므로 원문장 검사는 건너뜀"""
+    raw, sentence, ta = _safe_text(raw), _safe_text(sentence), _safe_text(ta)
+    problems = []
+    if not sentence:
+        problems.append("구문 분석 문장이 비어 있습니다.")
+    if not ta:
+        problems.append("TA 정답이 비어 있습니다.")
+    if problems:
+        return problems
+
+    sentence_chunks = sentence.split("/")
+    ta_chunks = ta.split("/")
+    if "/" not in sentence or "/" not in ta:
+        problems.append("구문 분석 문장과 TA 정답에는 슬래시(`/`)가 있어야 합니다.")
+    if len(sentence_chunks) != len(ta_chunks):
+        problems.append(
+            f"슬래시(`/`)로 나눈 칸 수가 다릅니다. (구문 분석 문장 {len(sentence_chunks)}칸, TA {len(ta_chunks)}칸)"
+        )
+    empty_chunks = [str(i + 1) for i, c in enumerate(sentence_chunks) if not _alnum(c)]
+    if empty_chunks:
+        problems.append(
+            f"구문 분석 문장에 알파벳·숫자가 없는 칸이 있습니다. ({', '.join(empty_chunks)}번째 칸) "
+            "슬래시를 연달아 쳤거나 끝에 슬래시가 남아 있지 않은지 확인해 주십시오."
+        )
+    balance_msg = bracket_balance_message(sentence)
+    if balance_msg:
+        problems.append("구문 분석 문장의 " + balance_msg)
+    square_cells = [
+        f"{i + 1}번째 칸 `{c.strip()}`"
+        for i, c in enumerate(ta_chunks)
+        if "[" in c or "]" in c
+    ]
+    if square_cells:
+        problems.append(
+            "TA 정답에 대괄호 `[ ]`가 있습니다. 성분 표기에는 소괄호 `( )`만 씁니다. ("
+            + ", ".join(square_cells)
+            + ")"
+        )
+    # 🔺 [F12] 연결어 도형: 후보 단어가 혼자 있는 칸에만, 한 칸에 하나만
+    shape_misplaced, shape_both = [], []
+    for i, c in enumerate(ta_chunks):
+        found = split_shape(c)[0]
+        if len(found) > 1:
+            shape_both.append(f"{i + 1}번째 칸")
+        if (
+            found
+            and i < len(sentence_chunks)
+            and not connector_candidate(sentence_chunks[i])
+        ):
+            shape_misplaced.append(f"{i + 1}번째 칸 `{sentence_chunks[i].strip()}`")
+    if shape_misplaced:
+        problems.append(
+            "도형(△·□)은 연결어 후보 단어(that, who, and 등)가 혼자 있는 칸에만 쓸 수 있습니다. ("
+            + ", ".join(shape_misplaced)
+            + ")"
+        )
+    if shape_both:
+        problems.append(
+            "한 칸에는 도형(△·□)을 하나만 쓸 수 있습니다. ("
+            + ", ".join(shape_both)
+            + ")"
+        )
+    # 🔧 [F7-2] 괄호 예외가 이 문장의 괄호와 맞는지
+    problems.extend(bracket_rule_problems(sentence, bracket_rules))
+    if raw:
+        if re.search(r"[/()\[\]]", raw):
+            problems.append(
+                "원문장에 슬래시나 괄호가 들어 있습니다. 원문장은 학생 화면에 그대로 보이므로 기호 없이 입력해 주십시오. "
+                "(원문장 칸과 구문 분석 문장 칸을 바꿔 넣지 않았는지도 확인해 주십시오)"
+            )
+        elif _alnum(raw) != _alnum(sentence):
+            problems.append(
+                "원문장과 구문 분석 문장의 단어(철자)가 다릅니다. "
+                + _first_word_diff(raw, sentence)
+            )
+    return problems
 
 
 # ==========================================
@@ -880,6 +1322,27 @@ SEED_QUESTIONS = [
 ]
 
 
+# [F7-2] 나중에 추가한 컬럼: 예전 DB(production)에 없을 때만 한 번 추가 (기존 행은 기본값 = 예전과 같음)
+#  💡 이미 있으면 표를 건드리지 않음. 앞으로 컬럼을 더할 때는 이 목록에 한 줄만 추가
+ADDED_QUESTION_COLUMNS = [("bracket_rules", "TEXT DEFAULT ''")]
+
+
+def _ensure_question_columns(t):
+    if t.db.is_pg:
+        existing = {
+            r["column_name"]
+            for r in t.all(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'questions'"
+            )
+        }
+    else:
+        existing = {r["name"] for r in t.all("PRAGMA table_info(questions)")}
+    for name, ddl in ADDED_QUESTION_COLUMNS:
+        if name not in existing:
+            t.run(f"ALTER TABLE questions ADD COLUMN {name} {ddl}")
+
+
 @st.cache_resource(show_spinner=False)
 def init_db():
     # 서버가 켜질 때 한 번만 실행 (표 만들기 + 예시 문제). 실패하면 다음 접속 때 다시 시도
@@ -887,6 +1350,7 @@ def init_db():
     with db.transaction() as t:
         for stmt in _ddl(db.is_pg):
             t.run(stmt)
+        _ensure_question_columns(t)
         if t.one("SELECT COUNT(*) AS n FROM questions")["n"] == 0:
             t.many(
                 "INSERT INTO questions (raw_sentence, sentence, answer_ta, answer_translation, set_name, order_num, is_active) "
@@ -920,6 +1384,7 @@ QUESTION_COLUMNS = [
     "order_num",
     "trans_mode",
     "grading_note",
+    "bracket_rules",
 ]
 
 
@@ -961,35 +1426,75 @@ def get_all_questions(only_active=False):
     # 💡 어떤 값이 저장돼 있어도 화면·채점에는 항상 표준 모드 값과 빈 문자열 메모로 전달
     df["trans_mode"] = df["trans_mode"].apply(normalize_trans_mode)
     df["grading_note"] = df["grading_note"].apply(_safe_text)
+    df["bracket_rules"] = df["bracket_rules"].apply(_safe_text)
     return df
 
 
-def add_question(raw, sentence, ta, trans, set_name, note):
+def add_question(raw, sentence, ta, trans, set_name, note, bracket_rules=""):
     # [📝 문제 출제] 탭에서 새 문제 1개 추가 (출제 대기 상태로 추가)
+    # 💡 순서 번호 = 그 세트의 마지막 번호 + 1 (예전에 999로 들어간 문제는 빼고 계산), 해석 모드는 그 세트를 따라감
+    # 반환: 그 세트가 지금 출제 중인지 (True면 화면에서 '아직 학생 화면에 안 보임' 안내)
     with _db().transaction() as t:
+        info = t.one(
+            "SELECT MAX(CASE WHEN order_num < 999 THEN order_num END) AS last_order, "
+            "MAX(is_active) AS any_active FROM questions WHERE set_name = :set_name",
+            {"set_name": set_name},
+        )
+        first = t.one(
+            "SELECT trans_mode FROM questions WHERE set_name = :set_name "
+            "ORDER BY order_num, id LIMIT 1",
+            {"set_name": set_name},
+        )
+        last_order = info["last_order"] if info else None
         t.run(
-            "INSERT INTO questions (raw_sentence, sentence, answer_ta, answer_translation, set_name, order_num, grading_note) "
-            "VALUES (:raw, :sentence, :ta, :trans, :set_name, 999, :note)",
+            "INSERT INTO questions (raw_sentence, sentence, answer_ta, answer_translation, set_name, order_num, trans_mode, grading_note, bracket_rules) "
+            "VALUES (:raw, :sentence, :ta, :trans, :set_name, :order_num, :mode, :note, :rules)",
             {
                 "raw": raw,
                 "sentence": sentence,
                 "ta": ta,
                 "trans": trans,
                 "set_name": set_name,
+                "order_num": int(last_order) + 1 if last_order is not None else 1,
+                "mode": (
+                    normalize_trans_mode(first["trans_mode"]) if first else "전체 해석"
+                ),
                 "note": note,
+                "rules": bracket_rules,
             },
         )
     get_all_questions.clear()
+    return bool(info and info["any_active"])
 
 
-def update_db_from_combined(df, set_active_states, set_trans_modes):
+class QuestionDataError(Exception):
+    """[📁 DB 관리] 저장 전 검사에 걸린 문항이 있음 → 아무것도 저장하지 않음
+    problems = [(문항 위치 표시, [안내 문구, ...]), ...]"""
+
+    def __init__(self, problems):
+        super().__init__(f"확인이 필요한 문항 {len(problems)}개")
+        self.problems = problems
+
+
+def question_label(set_name, order_num, preview):
+    # 검사 안내에서 문항을 찾기 쉽게 표시 (예: "[Set 1] 순서 3 · Because of that, education…")
+    preview = _safe_text(preview)
+    if len(preview) > 30:
+        preview = preview[:30] + "…"
+    return f"[{_safe_text(set_name) or '기본 세트'}] 순서 {order_num} · {preview}"
+
+
+def update_db_from_combined(df, set_active_states, set_trans_modes, cleared=None):
+    # 🔧 [F7-2] 괄호 예외는 표에서 고치지 않음: 문장의 괄호 종류 순서가 바뀐 문항은 예외 해제 → cleared 목록에 문항 이름
     """[📁 DB 관리] 탭 저장: 바뀐 내용을 문제 id 기준으로 수정하고, 삭제 체크한 문제만 지움.
     (예전처럼 전체 삭제 후 다시 넣지 않음 → 저장 중 학생 제출과 부딪히지 않음)
-    반환: (수정한 문제 수, 삭제한 문제 수, 빈 칸 때문에 건너뛴 문제 수) / 실패 시 예외 (아무것도 바뀌지 않음)"""
+    - 원문장·구문 분석 문장·TA를 고친 문항은 저장 전에 검사 → 하나라도 걸리면 QuestionDataError (아무것도 저장하지 않음)
+    - 세트 이름을 기존에 없는 새 이름으로 바꾼 문항은 원래 세트의 출제 체크·해석 모드를 따라감
+    반환: (수정한 문제 수, 삭제한 문제 수) / 실패 시 예외 (아무것도 바뀌지 않음)"""
     if df.empty:
-        return 0, 0, 0
+        return 0, 0
 
-    updates, deletes, skipped = [], [], 0
+    updates, deletes, typed = [], [], {}
     for _, row in df.iterrows():
         q_id = int(row["id"])
         if row.get("delete") == True:  # 빈 값(NaN)은 삭제로 보지 않음
@@ -998,14 +1503,13 @@ def update_db_from_combined(df, set_active_states, set_trans_modes):
 
         sentence_text = _safe_text(row.get("sentence"))
         ta_text = _safe_text(row.get("answer_ta"))
-        if not sentence_text or not ta_text:
-            skipped += 1  # 필수 칸이 비면 이 문제는 이전 내용 그대로 둠
-            continue
-
-        set_name_val = _safe_text(row.get("set_name")) or "기본 세트"
-        raw_val = _safe_text(row.get("raw_sentence"))
-        if not raw_val:
-            raw_val = strip_analysis_marks(sentence_text)
+        typed_raw = _safe_text(row.get("raw_sentence"))
+        # 표에 적힌 그대로 (고쳤는지 판단용: 마침표 자동 추가 같은 정리 때문에 '고친 문항'이 되지 않도록)
+        typed[q_id] = (typed_raw, sentence_text, ta_text)
+        stored_sentence = ensure_period(sentence_text) if sentence_text else ""
+        raw_val = typed_raw
+        if not raw_val and stored_sentence:
+            raw_val = strip_analysis_marks(stored_sentence)
         order_raw = row.get("order_num")
         order_num_val = int(order_raw) if pd.notna(order_raw) else 999
 
@@ -1013,15 +1517,11 @@ def update_db_from_combined(df, set_active_states, set_trans_modes):
             {
                 "id": q_id,
                 "raw": raw_val,
-                "sentence": ensure_period(sentence_text),
-                "ta": clean_tag_string(ta_text),
+                "sentence": stored_sentence,
+                "ta": ta_text,  # 선생님이 입력한 그대로 저장 (앞뒤 공백만 정리)
                 "trans": _safe_text(row.get("answer_translation")),
-                "active": 1 if set_active_states.get(set_name_val, False) else 0,
-                "set_name": set_name_val,
+                "set_name": _safe_text(row.get("set_name")) or "기본 세트",
                 "order_num": order_num_val,
-                "mode": normalize_trans_mode(
-                    set_trans_modes.get(set_name_val, "전체 해석")
-                ),
                 "note": _safe_text(row.get("grading_note")),
             }
         )
@@ -1032,9 +1532,55 @@ def update_db_from_combined(df, set_active_states, set_trans_modes):
             r["id"]: r
             for r in t.all(
                 "SELECT id, raw_sentence, sentence, answer_ta, answer_translation, is_active, "
-                "set_name, order_num, trans_mode, grading_note FROM questions"
+                "set_name, order_num, trans_mode, grading_note, bracket_rules FROM questions"
             )
         }
+        problems, cleared_now = [], []
+        for u in updates:
+            old = current.get(u["id"])
+            if old is None:
+                continue  # 그사이 다른 곳에서 지워진 문제
+            original_set = _safe_text(old["set_name"]) or "기본 세트"
+            # 💡 세트 이름을 기존에 없는 새 이름으로 바꾸면 원래 세트(폴더)의 출제 체크·해석 모드를 따라감
+            state_set = (
+                u["set_name"] if u["set_name"] in set_active_states else original_set
+            )
+            u["active"] = 1 if set_active_states.get(state_set, False) else 0
+            u["mode"] = normalize_trans_mode(
+                set_trans_modes.get(state_set, "전체 해석")
+            )
+            # 💡 원문장·구문 분석 문장·TA를 고친 문항만 검사 (손대지 않은 예전 문항 때문에 다른 저장이 막히지 않도록)
+            old_values = tuple(
+                _safe_text(old[c]) for c in ("raw_sentence", "sentence", "answer_ta")
+            )
+            old_rules = _safe_text(old.get("bracket_rules"))
+            u["rules"] = remap_bracket_rules(old_rules, old["sentence"], u["sentence"])
+            if old_rules and u["rules"] != old_rules:
+                cleared_now.append(
+                    question_label(
+                        original_set,
+                        u["order_num"],
+                        u["raw"] or build_clean_sentence(old),
+                    )
+                )
+            if typed[u["id"]] != old_values:
+                found = check_question_data(
+                    u["raw"], u["sentence"], u["ta"], u["rules"]
+                )
+                if found:
+                    label = question_label(
+                        original_set,
+                        u["order_num"],
+                        u["raw"] or build_clean_sentence(old),
+                    )
+                    problems.append((label, found))
+        if problems:
+            raise QuestionDataError(
+                problems
+            )  # 트랜잭션 전체 취소 (삭제 포함 아무것도 바뀌지 않음)
+        if cleared is not None:
+            cleared.extend(cleared_now)
+
         field_map = [
             ("raw", "raw_sentence"),
             ("sentence", "sentence"),
@@ -1045,6 +1591,7 @@ def update_db_from_combined(df, set_active_states, set_trans_modes):
             ("order_num", "order_num"),
             ("mode", "trans_mode"),
             ("note", "grading_note"),
+            ("rules", "bracket_rules"),
         ]
         changed = [
             u
@@ -1061,11 +1608,12 @@ def update_db_from_combined(df, set_active_states, set_trans_modes):
         t.many(
             "UPDATE questions SET raw_sentence = :raw, sentence = :sentence, answer_ta = :ta, "
             "answer_translation = :trans, is_active = :active, set_name = :set_name, "
-            "order_num = :order_num, trans_mode = :mode, grading_note = :note WHERE id = :id",
+            "order_num = :order_num, trans_mode = :mode, grading_note = :note, "
+            "bracket_rules = :rules WHERE id = :id",
             changed,
         )
     get_all_questions.clear()
-    return len(changed), len(deletes), skipped
+    return len(changed), len(deletes)
 
 
 def build_questions_snapshot(questions_df):
@@ -1485,7 +2033,14 @@ def clear_student_inputs():
     # 화면의 입력칸(분절·TA·해석) 값을 모두 비움 (다른 학생·다른 시험 값이 남지 않도록)
     for k in list(st.session_state.keys()):
         if k.startswith(
-            ("chunk_input_", "input_ta_", "input_trans_", "ta_layout_", "ta_memory_")
+            (
+                "chunk_input_",
+                "input_ta_",
+                "input_trans_",
+                "input_shape_",
+                "ta_layout_",
+                "ta_memory_",
+            )
         ):
             del st.session_state[k]
 
@@ -1503,6 +2058,9 @@ def apply_student_exam_state(name, exam_key):
         if k.startswith("chunk_input_"):
             st.session_state[k] = v
     st.session_state.loaded_exam_key = exam_key
+    # 💾 [S2] 새로 불러온 답안을 자동 저장 기준으로 다시 잡음 (다른 학생·시험의 기준·저장 시각이 남지 않게)
+    st.session_state.pop("autosave_marker", None)
+    st.session_state.pop("autosave_time_text", None)
 
 
 def collect_current_answers():
@@ -1514,7 +2072,56 @@ def collect_current_answers():
             draft_dict[k] = v
         elif k.startswith("input_ta_") or k.startswith("input_trans_"):
             draft_dict[k.replace("input_", "", 1)] = v
+        elif k.startswith("input_shape_"):
+            draft_dict[k.replace("input_", "", 1)] = v or ""  # 해제(None) → 빈 값
     return draft_dict
+
+
+AUTOSAVE_SECONDS = 60  # 💾 [S2] 자동 임시저장 최소 간격(초)
+
+
+def _answers_signature(answers):
+    # 답안 비교용 문자열 (순서와 상관없이 내용이 같으면 같은 값)
+    return json.dumps(answers, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def remember_saved_answers(answers):
+    # 수동 임시저장·제출 전 저장이 끝난 답안 → 자동 저장 기준으로 (같은 내용을 또 저장하지 않게)
+    st.session_state["autosave_signature"] = _answers_signature(answers)
+    st.session_state["autosave_at"] = time.time()
+
+
+def run_student_autosave(name, exam_key):
+    """💾 [S2] 학생 입력 자동 임시저장 (학생 화면을 다 그린 뒤 맨 끝에서 호출)
+    - 타이머 없이, 학생이 입력해서 화면이 다시 그려질 때만 확인 (Neon을 주기적으로 깨우지 않음)
+    - 시험을 불러온 직후 화면의 답안이 기준. 내용이 바뀌었고 마지막 저장 뒤 AUTOSAVE_SECONDS가 지났을 때만 저장
+    - 실패해도 학생 화면에는 띄우지 않고 로그만 남김 (수동 임시저장 버튼은 그대로)"""
+    ss = st.session_state
+    if not str(ss.get("test_status", "PROGRESS")).startswith("PROGRESS"):
+        return
+    answers = collect_current_answers()
+    signature = _answers_signature(answers)
+    marker = f"{name}|{exam_key}"
+    if ss.get("autosave_marker") != marker:
+        # 이 학생·시험을 처음 그린 화면: 불러온 답안을 기준으로 삼음 (첫 변경은 바로 저장)
+        ss["autosave_marker"] = marker
+        ss["autosave_signature"] = signature
+        ss["autosave_at"] = 0.0
+        return
+    if signature == ss.get("autosave_signature"):
+        return
+    if time.time() - float(ss.get("autosave_at") or 0.0) < AUTOSAVE_SECONDS:
+        return
+    ss["autosave_at"] = (
+        time.time()
+    )  # 실패해도 간격을 지켜 다시 시도 (DB 장애 때 매번 부르지 않게)
+    try:
+        save_student_draft(name, exam_key, answers)
+    except Exception as e:
+        print(f"[DB] 자동 임시저장 실패: {e}")
+        return
+    ss["autosave_signature"] = signature
+    ss["autosave_time_text"] = datetime.now(KST).strftime("%H:%M")
 
 
 def _chunk_content_keys(chunks):
@@ -1528,11 +2135,17 @@ def _chunk_content_keys(chunks):
     return keys
 
 
-def prepare_ta_inputs(q_id, chunks):
+def _shape_widget_value(value):
+    # 도형 버튼 값으로 쓸 수 있는 것만 (그 외는 해제 = None)
+    return value if value in SHAPES else None
+
+
+def prepare_ta_inputs(q_id, chunks, shapes_on=False):
     """TA 입력칸 값을 현재 칸 목록에 맞춰 준비 (입력칸을 그리기 직전에 호출)
     - 처음 그릴 때: 불러온 답안(칸 순서 기준)을 그대로 사용
     - 슬래시를 넣거나 빼서 칸이 바뀌면: 내용이 같은 칸은 태그를 따라 옮기고, 새로 생긴 칸은 빈칸
-      (띄어쓰기·문장부호·괄호만 고친 경우는 칸 내용이 같으므로 태그가 그대로 유지됨)"""
+      (띄어쓰기·문장부호·괄호만 고친 경우는 칸 내용이 같으므로 태그가 그대로 유지됨)
+    - 🔺 [F12] 도형 버튼(shapes_on일 때 후보 칸만)도 태그와 같은 규칙으로 따라감 (기억 이름: '칸 이름|shape')"""
     layout_key = f"ta_layout_{q_id}"
     memory_key = f"ta_memory_{q_id}"
     new_layout = _chunk_content_keys(chunks)
@@ -1546,8 +2159,22 @@ def prepare_ta_inputs(q_id, chunks):
             widget_key = f"input_ta_{q_id}_{i}"
             if widget_key in st.session_state:
                 memory[content_key] = str(st.session_state[widget_key] or "")
+            shape_key = f"input_shape_{q_id}_{i}"
+            if shape_key in st.session_state:
+                memory[content_key + "|shape"] = st.session_state[shape_key] or ""
+        # 도형은 후보 칸에만 있으므로 칸이 바뀌면 모두 지우고 새 칸 기준으로 다시 채움 (임시저장 값 포함)
+        for store, prefix in (
+            (st.session_state, f"input_shape_{q_id}_"),
+            (saved, f"shape_{q_id}_"),
+        ):
+            for k in [k for k in list(store.keys()) if str(k).startswith(prefix)]:
+                del store[k]
         for i, content_key in enumerate(new_layout):
             st.session_state[f"input_ta_{q_id}_{i}"] = memory.get(content_key, "")
+            if shapes_on and connector_candidate(chunks[i]):
+                st.session_state[f"input_shape_{q_id}_{i}"] = _shape_widget_value(
+                    memory.get(content_key + "|shape")
+                )
         # 없어진 칸의 값 정리 (임시저장에 옛 칸 값이 남지 않도록)
         for store, prefix in (
             (st.session_state, f"input_ta_{q_id}_"),
@@ -1567,6 +2194,17 @@ def prepare_ta_inputs(q_id, chunks):
                     st.session_state[widget_key] = str(
                         saved.get(f"ta_{q_id}_{i}", "") or ""
                     )
+            shape_key = f"input_shape_{q_id}_{i}"
+            if (
+                shapes_on
+                and connector_candidate(chunks[i])
+                and shape_key not in st.session_state
+            ):
+                if content_key + "|shape" in memory:
+                    value = memory[content_key + "|shape"]
+                else:
+                    value = saved.get(f"shape_{q_id}_{i}")
+                st.session_state[shape_key] = _shape_widget_value(value)
 
     st.session_state[layout_key] = new_layout
     st.session_state[memory_key] = memory
@@ -1587,53 +2225,110 @@ st.markdown(
     .stDataFrame { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     .splash-container { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 70vh; }
     
-    /* ✨ 1. 메인 타이틀 및 모드 선택: 골드 그라데이션 텍스트 */
+    /* ✨ 1. 메인 타이틀 및 모드 선택: 샴페인 골드 + 빛이 지나가는 반짝임 (B안) */
     .main-title { font-size: 4.5rem; font-weight: 900; margin-bottom: 10px; letter-spacing: 1px;
-                  background: linear-gradient(to right, #BF953F, #FCF6BA, #B38728, #FBF5B7, #AA771C); 
-                  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .mode-title { text-align: center; margin-top: 100px; font-weight: 800; font-size: 2.5rem; 
-                  background: linear-gradient(to right, #BF953F, #FCF6BA, #B38728, #FBF5B7, #AA771C); 
-                  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+                  background: linear-gradient(115deg, #8F7130 0%, #BF9B45 28%, #EBDCAE 46%, #F8F0D8 50%, #EBDCAE 54%, #BF9B45 72%, #8F7130 100%);
+                  background-size: 260% 100%; animation: sete-shine 3.2s ease-in-out infinite;
+                  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+    .mode-title { text-align: center; margin-top: 100px; font-weight: 800; font-size: 2.5rem;
+                  background: linear-gradient(115deg, #8F7130 0%, #BF9B45 28%, #EBDCAE 46%, #F8F0D8 50%, #EBDCAE 54%, #BF9B45 72%, #8F7130 100%);
+                  background-size: 260% 100%; animation: sete-shine 3.2s ease-in-out infinite;
+                  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+    /* 반짝임: 3.2초마다 빛 띠가 오른쪽에서 왼쪽으로 한 번 지나감 (기기에서 '동작 줄이기'를 켜면 멈춘 채 가운데에 빛) */
+    @keyframes sete-shine { 0% { background-position: 100% 0; } 60%, 100% { background-position: 0% 0; } }
+    @media (prefers-reduced-motion: reduce) { .main-title, .mode-title { animation: none; background-position: 50% 0; } }
     
-    /* 🪨 서브타이틀 및 푸터: 웜 스톤 그레이 (골드 테마와 조화) */
-    .sub-title { font-size: 1.8rem; color: #78716C; font-weight: 600; margin-bottom: 50px; }
-    .lsb-footer { position: fixed; bottom: 15px; left: 20px; font-size: 0.85rem; color: #A8A29E; }
+    /* 🪨 서브타이틀 및 푸터: 슬레이트 그레이 (네이비·골드 테마와 조화) */
+    .sub-title { font-size: 1.8rem; color: #5A6478; font-weight: 600; margin-bottom: 50px; }
+    .lsb-footer { position: fixed; bottom: 15px; left: 20px; font-size: 0.85rem; color: #98A0AE; }
     
-    /* ✨ 2. 구문 의미 단위 밑줄: 클래식 메탈릭 골드 단색 */
-    .chunk-box { text-align: center; font-size: 18px; font-weight: bold; border-bottom: 2px solid #D4AF37; margin-bottom: 10px; padding-bottom: 5px; }
+    /* ✨ 2. 구문 의미 단위 밑줄: 샴페인 골드 단색 */
+    .chunk-box { text-align: center; font-size: 18px; font-weight: bold; border-bottom: 2px solid #C9A64F; margin-bottom: 10px; padding-bottom: 5px; }
+    /* TA 성분 입력칸 가운데 정렬 (학생: input_ta_ / 선생님 출제란: compose_ta_) */
+    [class*="st-key-input_ta_"] input, [class*="st-key-compose_ta_"] input { text-align: center; }
     
     /* 피드백 박스 (구문 정답/오답 표시용) */
     .fb-pass { background-color:#d4edda; color:#155724; padding: 5px; border-radius: 5px; text-align: center; font-weight: bold; }
     .fb-fail { background-color:#f8d7da; color:#721c24; padding: 5px; border-radius:5px; text-align: center; font-weight: bold; }
     .fb-edit { background-color:#F1F5F9; color:#475569; padding: 5px; border-radius:5px; text-align: center; font-weight: bold; }
 
-    /* ✨ 3. 버튼 테마 오버라이딩 (샴페인 골드) */
+    /* ✨ 3. 버튼 테마 오버라이딩 (B안: 네이비 + 골드 글씨) */
     .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #D4AF37, #AA771C) !important;
-        color: white !important;
+        background: #1E2B45 !important;
+        color: #E3C77A !important;
         border: none !important;
         font-weight: bold !important;
     }
     .stButton > button[kind="primary"]:hover {
-        background: linear-gradient(135deg, #E6C865, #BF953F) !important;
+        background: #2B3C5E !important;
     }
     .stButton > button[kind="secondary"] {
-        border: 1px solid #D4AF37 !important;
-        color: #AA771C !important;
+        border: 1px solid #C2A250 !important;
+        color: #8A6D2A !important;
         background-color: transparent !important;
         font-weight: bold !important;
     }
     .stButton > button[kind="secondary"]:hover {
-        background-color: #FFFDF7 !important;
-        border-color: #BF953F !important;
-        color: #BF953F !important;
+        background-color: #F6F7FA !important;
+        border-color: #8A6D2A !important;
+        color: #6F5720 !important;
     }
 
-    /* ✨ 4. 안내 박스(st.info) 테마: 웜 아이보리 배경 & 클래식 골드 라인 */
-    div[data-testid="stAlert"] {
-        background-color: #FCFAF6 !important;
+    /* 🧭 포인트 버튼 (네이비 + 골드): 출제란 'DB에 문제 추가하기', '주요 TA 성분표'(선생님·학생). 펼친 성분표 내용은 흰 바탕 그대로 */
+    [class*="st-key-compose_add_btn"] button,
+    [class*="st-key-ta_popover"] button {
+        background: #1E2B45 !important;
         border: none !important;
-        border-left: 5px solid #D4AF37 !important;
+    }
+    [class*="st-key-compose_add_btn"] button:hover,
+    [class*="st-key-ta_popover"] button:hover {
+        background: #2B3C5E !important;
+    }
+    [class*="st-key-compose_add_btn"] button, [class*="st-key-compose_add_btn"] button *,
+    [class*="st-key-ta_popover"] button, [class*="st-key-ta_popover"] button * {
+        color: #E3C77A !important;
+        font-weight: bold !important;
+    }
+
+    /* 📖 선생님 탭 '사용법 보기' 상자 (A안): 제목 줄 = 버튼과 같은 네이비 띠 + 금색 글씨, 펼친 본문 = 흰 바탕 */
+    [class*="st-key-guide_"] [data-testid="stExpander"] details {
+        background-color: #FFFFFF !important;
+        border: 1px solid #1E2B45 !important;
+        border-radius: 8px !important;
+        overflow: hidden !important;
+    }
+    [class*="st-key-guide_"] [data-testid="stExpander"] summary {
+        background-color: #1E2B45 !important;
+    }
+    [class*="st-key-guide_"] [data-testid="stExpander"] summary,
+    [class*="st-key-guide_"] [data-testid="stExpander"] summary * {
+        color: #E3C77A !important;
+    }
+    [class*="st-key-guide_"] [data-testid="stExpander"] summary:hover,
+    [class*="st-key-guide_"] [data-testid="stExpander"] summary:hover * {
+        color: #F0D99A !important;
+    }
+    [class*="st-key-guide_"] [data-testid="stExpander"] summary p {
+        font-weight: 600 !important;
+    }
+    /* 사용법 줄: 이모지 칸 + 글 칸 (두 줄 이상이어도 글 시작 위치가 맞음) */
+    .guide-row {
+        display: grid;
+        grid-template-columns: 1.8em 1fr;
+        column-gap: 0.25em;
+        margin: 0 0 0.75em;
+        color: #2A3245;
+        line-height: 1.65;
+    }
+    .guide-row:last-child {
+        margin-bottom: 0.25em;
+    }
+
+    /* ✨ 4. 안내 박스(st.info) 테마: 쿨 그레이 배경 & 샴페인 골드 라인 (B안) */
+    div[data-testid="stAlert"] {
+        background-color: #F6F7FA !important;
+        border: none !important;
+        border-left: 5px solid #C9A64F !important;
         border-radius: 4px !important;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05) !important;
     }
@@ -1643,11 +2338,11 @@ st.markdown(
         background-color: transparent !important; 
     }
     
-    /* 딥 브라운 텍스트 가독성 최적화 */
+    /* 네이비 차콜 글자 (가독성) */
     div[data-testid="stAlert"] p, 
     div[data-testid="stAlert"] span, 
     div[data-testid="stAlert"] div {
-        color: #433E39 !important;
+        color: #2A3245 !important;
         font-weight: 500 !important;
     }
     
@@ -1711,9 +2406,535 @@ except Exception as e:
     )
     st.stop()
 
+# ==========================================
+# [문제 출제란] 칸 카드 방식 (F7-3)
+#  - 구문 분석 문장을 넣고 Enter → 슬래시로 나눈 칸마다 TA 입력칸 (칸 수가 어긋날 수 없음)
+#  - 출제란 전체가 form 하나: 적는 동안 화면이 다시 그려지지 않고, Enter·버튼을 누를 때 모든 값이 한 번에 반영됨
+#    (form 안에서 Enter = 첫 번째 버튼 '칸 만들기' → 어느 칸에서 Enter를 눌러도 문제가 추가되지 않음)
+#  - 저장 경로는 예전과 같음: 칸별 TA를 " / "로 합침 → ensure_period → check_question_data → add_question
+# ==========================================
+COMPOSE_ROW_CHARS = 50  # 칸 카드 한 줄에 놓을 글자 수 기준
+COMPOSE_ROW_CHUNKS = 5  # 한 줄 최대 칸 수
+COMPOSE_MIN_WIDTH = 6  # 짧은 칸(is, as)도 TA를 적을 수 있게 주는 최소 폭 (글자 수 기준)
+COMPOSE_SHAPE_WIDTH = (
+    14  # 🔺 도형 버튼(△ 관계사 / □ 접속사)이 들어가는 후보 칸의 최소 폭
+)
+COMPOSE_BUILD_LABEL = "✂️ 칸 만들기 · 다시 보기 (Enter)"
+COMPOSE_FILL_LABEL = "칸에 채우기"
+COMPOSE_ADD_LABEL = "DB에 문제 추가하기 ➕"
+COMPOSE_DEFAULT_SET = "수동 출제 세트"
+
+
+def layout_chunk_rows(
+    chunks,
+    max_chars=COMPOSE_ROW_CHARS,
+    max_chunks=COMPOSE_ROW_CHUNKS,
+    min_width=COMPOSE_MIN_WIDTH,
+):
+    """칸 목록을 화면 줄로 나눔 → [[(칸 번호, 칸 글자, 폭), ...], ...]
+    - 순서대로 놓다가 글자 수 합이 기준을 넘거나 칸 수가 차면 다음 줄 (기준보다 긴 칸은 혼자 한 줄)
+    - 폭은 글자 수에 비례 (짧은 칸은 최소 폭)"""
+    rows, current, used = [], [], 0
+    for i, chunk in enumerate(chunks):
+        text = str(chunk).strip()
+        width = max(len(text), min_width)
+        if connector_candidate(text):
+            width = max(width, COMPOSE_SHAPE_WIDTH)
+        if current and (used + width > max_chars or len(current) >= max_chunks):
+            rows.append(current)
+            current, used = [], 0
+        current.append((i, text, width))
+        used += width
+    if current:
+        rows.append(current)
+    return rows
+
+
+def compose_ta_line(parts):
+    # 칸별 TA → 저장용 한 줄 (예: ["prep", "", "S"] → "prep / / S"). 칸 안의 글자는 그대로, 칸 앞뒤 공백만 정리
+    line = " / ".join(str(p or "").strip() for p in parts)
+    return re.sub(r"/\s+(?=/)", "/ ", line).strip()
+
+
+def compose_sentence_problems(raw, sentence):
+    """출제란 미리 알림: 문장만 입력된 상태에서 최종 검사(check_question_data)와 같은 문구
+    (TA는 아직 없으므로 칸 수만큼 임시 값으로 채워 TA 쪽 검사는 통과시킴)"""
+    n = len(str(sentence).split("/"))
+    return check_question_data(raw, sentence, " / ".join(["x"] * n))
+
+
+def prepare_compose_inputs(chunks):
+    """출제란 칸별 TA 입력칸 값 준비 (칸을 그리기 직전에 호출)
+    - 문장을 고쳐 칸이 바뀌면 내용이 같은 칸으로 TA를 옮기고, 새 칸은 빈칸 (학생 화면 '태그 옮겨주기'와 같은 칸 이름 규칙)"""
+    ss = st.session_state
+    new_layout = _chunk_content_keys(chunks)
+    old_layout = ss.get("compose_layout")
+    memory = dict(ss.get("compose_memory") or {})
+    if old_layout is not None and old_layout != new_layout:
+        for i, content_key in enumerate(old_layout):
+            if f"compose_ta_{i}" in ss:
+                memory[content_key] = str(ss[f"compose_ta_{i}"] or "")
+            if f"compose_shape_{i}" in ss:
+                memory[content_key + "|shape"] = ss[f"compose_shape_{i}"] or ""
+        for k in [
+            k
+            for k in list(ss.keys())
+            if str(k).startswith(("compose_ta_", "compose_shape_"))
+        ]:
+            del ss[k]
+        for i, content_key in enumerate(new_layout):
+            ss[f"compose_ta_{i}"] = memory.get(content_key, "")
+            if connector_candidate(chunks[i]):
+                ss[f"compose_shape_{i}"] = _shape_widget_value(
+                    memory.get(content_key + "|shape")
+                )
+    else:
+        for i, content_key in enumerate(new_layout):
+            if f"compose_ta_{i}" not in ss:
+                ss[f"compose_ta_{i}"] = memory.get(content_key, "")
+            if connector_candidate(chunks[i]) and f"compose_shape_{i}" not in ss:
+                ss[f"compose_shape_{i}"] = _shape_widget_value(
+                    memory.get(content_key + "|shape")
+                )
+    ss["compose_layout"] = new_layout
+    ss["compose_memory"] = memory
+
+
+def _bracket_keys(sentence):
+    # 괄호마다 이름표 (종류 + 안쪽 글자, 같으면 순번) → 문장을 고쳐도 같은 괄호를 찾아 예외가 따라감
+    sentence = _safe_text(sentence)
+    keys, seen = [], {}
+    for kind, start, end in bracket_pairs(sentence):
+        base = kind + _alnum(sentence[start:end])
+        seen[base] = seen.get(base, 0) + 1
+        keys.append(f"{base}#{seen[base]}")
+    return keys
+
+
+def prepare_compose_brackets(sentence):
+    """🔧 [F7-2] 출제란 '괄호 예외' 버튼 값 준비 (버튼을 그리기 직전에 호출). 반환: (괄호 목록, 쪼개기 가능한 괄호 번호)
+    - 문장을 고쳐도 괄호 종류 순서가 같으면 번호 그대로 (DB 관리 탭과 같은 규칙: 괄호 안 단어만 고친 경우)
+    - 괄호가 늘거나 줄면 같은 괄호(종류·글자가 같은 것)로 고른 값이 따라가고, 고를 수 없게 된 값은 지움"""
+    ss = st.session_state
+    pairs = bracket_pairs(sentence)
+    new_keys = _bracket_keys(sentence)
+    old_keys = ss.get("compose_br_layout")
+    memory = dict(ss.get("compose_br_memory") or {})
+    if old_keys is not None and [k[0] for k in old_keys] != [k[0] for k in new_keys]:
+        omit_now = set(ss.get("compose_br_omit") or [])
+        split_now = set(ss.get("compose_br_split") or [])
+        for i, key in enumerate(old_keys):
+            memory[key] = (BRACKET_OMIT if i in omit_now else "") + (
+                BRACKET_SPLIT if i in split_now else ""
+            )
+        ss["compose_br_omit"] = [
+            i for i, key in enumerate(new_keys) if BRACKET_OMIT in memory.get(key, "")
+        ]
+        ss["compose_br_split"] = [
+            i for i, key in enumerate(new_keys) if BRACKET_SPLIT in memory.get(key, "")
+        ]
+    splittable = [i for i, p in enumerate(pairs) if bracket_splittable(sentence, p)]
+    # 선택지에 없는 값이 남지 않게 (버튼 오류 방지)
+    ss["compose_br_omit"] = [
+        i for i in (ss.get("compose_br_omit") or []) if i < len(pairs)
+    ]
+    ss["compose_br_split"] = [
+        i for i in (ss.get("compose_br_split") or []) if i in splittable
+    ]
+    ss["compose_br_layout"] = new_keys
+    ss["compose_br_memory"] = memory
+    return pairs, splittable
+
+
+def compose_bracket_rules(sentence):
+    # 출제란에서 고른 괄호 예외 → 저장 형식 "2o,3s" (이 문장에 맞는 것만)
+    ss = st.session_state
+    rules = {}
+    for flag, key in (
+        (BRACKET_OMIT, "compose_br_omit"),
+        (BRACKET_SPLIT, "compose_br_split"),
+    ):
+        for i in ss.get(key) or []:
+            rules.setdefault(int(i), set()).add(flag)
+    return format_bracket_rules(
+        valid_bracket_rules(sentence, format_bracket_rules(rules))
+    )
+
+
+def _compose_layout_is_current():
+    # 지금 보이는 칸이 지금 입력된 구문 분석 문장으로 만든 것인지 (문장을 고치고 Enter 없이 버튼을 누른 경우 False)
+    ss = st.session_state
+    built = ss.get("compose_layout_sentence")
+    return (
+        built is not None and str(ss.get("compose_sentence", "") or "").strip() == built
+    )
+
+
+def _compose_clear():
+    # 추가 성공 후 입력 비우기 (세트 이름은 남겨 같은 세트를 이어서 출제)
+    ss = st.session_state
+    for k in (
+        "compose_raw",
+        "compose_sentence",
+        "compose_trans",
+        "compose_note",
+        "compose_paste",
+    ):
+        ss[k] = ""
+    for k in [
+        k
+        for k in list(ss.keys())
+        if str(k).startswith(("compose_ta_", "compose_shape_", "compose_br_"))
+    ]:
+        del ss[k]
+    for k in ("compose_layout", "compose_layout_sentence"):
+        if k in ss:
+            del ss[k]
+    ss["compose_memory"] = {}
+
+
+COMPOSE_LAYOUT_CHANGED_MSG = "🚨 구문 분석 문장이 바뀌어 칸을 다시 만들었습니다. 아래 칸을 확인한 뒤 다시 눌러 주십시오."
+
+
+def _compose_fill_from_line():
+    # [칸에 채우기] 버튼: TA 한 줄을 슬래시로 나눠 칸마다 채움 (칸 수가 다르면 채우지 않음)
+    ss = st.session_state
+    line = str(ss.get("compose_paste", "") or "").strip()
+    if not line:
+        ss["compose_notice"] = [
+            ("warning", "📋 붙여넣을 TA를 입력한 뒤 '칸에 채우기'를 눌러 주십시오.")
+        ]
+        return
+    if not _compose_layout_is_current():
+        ss["compose_notice"] = [("error", COMPOSE_LAYOUT_CHANGED_MSG)]
+        return
+    layout = ss.get("compose_layout") or []
+    parts = line.split("/")
+    if len(parts) != len(layout):
+        ss["compose_notice"] = [
+            (
+                "error",
+                f"🚨 붙여넣은 TA는 {len(parts)}칸, 구문 분석 문장은 {len(layout)}칸입니다. 칸 수를 맞춰 다시 붙여넣어 주십시오.",
+            )
+        ]
+        return
+    chunks = str(ss.get("compose_sentence", "") or "").strip().split("/")
+    for i, part in enumerate(parts):
+        text = part.strip()
+        if i < len(chunks) and connector_candidate(chunks[i]):
+            # 🔺 후보 칸의 도형은 버튼으로 옮김 ("△(S)" → 버튼 △ + 칸 "S"). 도형이 둘이면 그대로 두어 검사에서 안내
+            found, rest = split_shape(text)
+            if len(found) == 1:
+                rest = rest.strip()
+                inner = re.fullmatch(r"\(([^()]*)\)", rest)
+                ss[f"compose_shape_{i}"] = next(iter(found))
+                text = inner.group(1).strip() if inner else rest
+            elif not found:
+                ss[f"compose_shape_{i}"] = None
+        ss[f"compose_ta_{i}"] = text
+    ss["compose_paste"] = ""
+    ss["compose_notice"] = [
+        ("success", f"📋 TA {len(parts)}칸을 채웠습니다. 칸마다 확인해 주십시오.")
+    ]
+
+
+def _compose_submit():
+    # [DB에 문제 추가하기] 버튼: 칸별 TA를 합쳐 예전과 같은 검사·저장 경로로 추가
+    ss = st.session_state
+    set_name = str(ss.get("compose_set", "") or "").strip()
+    sentence = str(ss.get("compose_sentence", "") or "").strip()
+    raw = str(ss.get("compose_raw", "") or "").strip()
+    trans = str(ss.get("compose_trans", "") or "").strip()
+    note = str(ss.get("compose_note", "") or "").strip()
+
+    if not set_name or not sentence or not trans:
+        ss["compose_notice"] = [
+            (
+                "error",
+                "🚨 세트 이름, 구문 분석 문장, 해석은 모두 입력해야 합니다. (원문장은 비워도 됩니다)",
+            )
+        ]
+        return
+    if not _compose_layout_is_current():
+        ss["compose_notice"] = [("error", COMPOSE_LAYOUT_CHANGED_MSG)]
+        return
+
+    parts = [
+        str(ss.get(f"compose_ta_{i}", "") or "").strip()
+        for i in range(len(ss.get("compose_layout") or []))
+    ]
+    slash_cells = [str(i + 1) for i, p in enumerate(parts) if "/" in p]
+    if slash_cells:
+        ss["compose_notice"] = [
+            (
+                "error",
+                f"🚨 TA 칸에는 슬래시(`/`)를 쓸 수 없습니다. ({', '.join(slash_cells)}번째 칸) "
+                "하나만 써도 정답으로 하려면 세로선(`|`)으로 구분해 주십시오.",
+            )
+        ]
+        return
+
+    # 🔺 후보 칸은 도형 버튼과 TA를 합침 ("△" + "S" → "△(S)")
+    chunks = sentence.split("/")
+    parts = [
+        combine_shape_ta(
+            ss.get(f"compose_shape_{i}") if connector_candidate(chunks[i]) else None, p
+        )
+        for i, p in enumerate(parts)
+    ]
+    ta = compose_ta_line(parts)
+    stored_sentence = ensure_period(sentence)
+    bracket_rules = compose_bracket_rules(sentence)
+    # 💡 DB 관리 탭 저장과 같은 검사 (칸 수·철자·괄호 짝·대괄호·괄호 예외 등)
+    problems = check_question_data(raw, stored_sentence, ta, bracket_rules)
+    if problems:
+        ss["compose_notice"] = [
+            (
+                "error",
+                "🚨 아래 내용을 고친 뒤 다시 추가해 주십시오. (입력한 내용은 그대로 남아 있습니다)\n\n"
+                + "\n".join(f"* {p}" for p in problems),
+            )
+        ]
+        return
+    try:
+        set_was_active = add_question(
+            raw or strip_analysis_marks(stored_sentence),
+            stored_sentence,
+            ta,
+            trans,
+            set_name,
+            note,
+            bracket_rules,
+        )
+    except Exception as e:
+        print(f"[DB] 문제 추가 실패: {e}")
+        ss["compose_notice"] = [
+            ("error", "🚨 문제를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+        ]
+        return
+
+    notice = [("success", f"🎉 '{set_name}' 세트에 성공적으로 추가되었습니다.")]
+    if set_was_active:
+        notice.append(
+            (
+                "warning",
+                f"⚠️ '{set_name}' 세트는 지금 출제 중입니다. 추가한 문제는 아직 학생 화면에 보이지 않으며, "
+                "[📁 DB 관리 및 출제] 탭에서 저장 버튼을 누르면 이 세트에 함께 출제됩니다.",
+            )
+        )
+    _compose_clear()
+    ss["compose_notice"] = notice
+    ss["compose_rerun_app"] = (
+        True  # [결정 8] 다음 그리기 때 화면 전체를 한 번 다시 그림
+    )
+
+
+def _compose_badge(text):
+    return (
+        "<span style='display:inline-block; background:#d4edda; color:#155724; padding:2px 10px; "
+        f"border-radius:6px; margin:0 6px 6px 0; font-size:0.85rem;'>{html.escape(text)}</span>"
+    )
+
+
+@st.fragment
+def render_question_composer():
+    # 문제 출제란 (이 부분만 다시 그려서 다른 탭·DB 조회에 영향 없음)
+    ss = st.session_state
+    # [결정 8] 문제를 추가한 직후에는 화면 전체를 한 번 다시 그림 (DB 관리 탭 목록·대기 문제 수에 바로 반영)
+    #  💡 추가 완료 안내(compose_notice)는 남겨 두었다가 전체를 다시 그린 화면에서 표시
+    if ss.pop("compose_rerun_app", False):
+        st.rerun(scope="app")
+    if "compose_set" not in ss:
+        ss["compose_set"] = COMPOSE_DEFAULT_SET
+
+    with st.form("question_composer_form"):
+        col_set, col_sentence = st.columns([1, 3])
+        with col_set:
+            st.text_input("세트 이름 (예: Set 5)", key="compose_set")
+        with col_sentence:
+            st.text_input(
+                "구문 분석 문장 (예: (Because of / that), / education / becomes / very / important.)",
+                key="compose_sentence",
+            )
+        # ⚠️ form 안 첫 번째 버튼이어야 함 (어느 칸에서 Enter를 눌러도 이 버튼이 눌린 것으로 처리됨)
+        st.form_submit_button(COMPOSE_BUILD_LABEL)
+        with st.expander(
+            "✏️ 원문장 직접 입력 (선택) — 비워 두면 구문 분석 문장에서 자동으로 만들어집니다"
+        ):
+            st.text_input(
+                "원문장 (예: Because of that, education becomes very important.)",
+                key="compose_raw",
+            )
+
+        sentence = str(ss.get("compose_sentence", "") or "").strip()
+        raw = str(ss.get("compose_raw", "") or "").strip()
+        if not sentence:
+            if "compose_layout_sentence" in ss:
+                del ss["compose_layout_sentence"]
+            st.caption(
+                "👆 구문 분석 문장을 입력하고 Enter를 누르면 아래에 칸이 만들어집니다."
+            )
+        else:
+            stored_sentence = ensure_period(sentence)
+            chunks = sentence.split("/")
+            preview = raw or strip_analysis_marks(stored_sentence)
+            st.markdown(
+                "<div style='background:#F6F7FA; border:1px solid #E3E6EE; border-radius:8px; padding:8px 12px; margin:4px 0 8px;'>"
+                f"<div style='font-size:0.8rem; color:#5A6478;'>👀 학생에게 보이는 문장{'' if raw else ' (자동 생성)'}</div>"
+                f"<div>{html.escape(preview)}</div></div>",
+                unsafe_allow_html=True,
+            )
+            problems = compose_sentence_problems(raw, stored_sentence)
+            br_pairs, br_splittable = prepare_compose_brackets(sentence)
+            if problems:
+                st.error(
+                    "🚨 추가하기 전에 고칠 곳이 있습니다.\n\n"
+                    + "\n".join(f"* {p}" for p in problems)
+                )
+            else:
+                pairs = sentence.count("(") + sentence.count("[")
+                badges = [f"칸 {len(chunks)}개"]
+                if pairs:
+                    badges.append(f"괄호 {pairs}쌍 짝 정상")
+                br_count = len(parse_bracket_rules(compose_bracket_rules(sentence))[0])
+                if br_count:
+                    badges.append(f"괄호 예외 {br_count}개")
+                badges.append("원문장 철자 일치" if raw else "원문장 자동 생성")
+                st.markdown(
+                    "".join(_compose_badge(b) for b in badges), unsafe_allow_html=True
+                )
+
+            prepare_compose_inputs(chunks)
+            ss["compose_layout_sentence"] = sentence
+
+            with st.expander("📋 TA 한 줄로 붙여넣기 (선택)"):
+                st.text_input(
+                    "TA 한 줄 (예: prep / / S / Vl / adv / SC)", key="compose_paste"
+                )
+                st.form_submit_button(
+                    COMPOSE_FILL_LABEL, on_click=_compose_fill_from_line
+                )
+
+            with st.container(border=True):
+                for row in layout_chunk_rows(chunks):
+                    widths = [w for _, _, w in row]
+                    spare = COMPOSE_ROW_CHARS - sum(widths)
+                    cols = st.columns(
+                        widths + ([spare] if spare > 0 else []),
+                        vertical_alignment="bottom",
+                    )
+                    for col, (i, text, _) in zip(cols, row):
+                        with col:
+                            label = (
+                                html.escape(text)
+                                if text
+                                else "<span style='color:#98A0AE;'>(빈 칸)</span>"
+                            )
+                            st.markdown(
+                                f"<div class='chunk-box' style='overflow-wrap:anywhere;'>{label}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            if connector_candidate(text):
+                                # 🔺 연결어 도형 버튼 (TA 칸 위: 칸 아래쪽 맞춤에서 TA 칸 줄이 흐트러지지 않게)
+                                st.segmented_control(
+                                    f"{i + 1}번째 칸 도형",
+                                    SHAPES,
+                                    format_func=SHAPE_LABELS.get,
+                                    key=f"compose_shape_{i}",
+                                    label_visibility="collapsed",
+                                )
+                            st.text_input(
+                                f"{i + 1}번째 칸 TA",
+                                key=f"compose_ta_{i}",
+                                label_visibility="collapsed",
+                            )
+
+            if br_pairs:
+                # 🔧 [F7-2] 괄호 예외 (기본 접힘): 괄호를 눌러 고름, 괄호 수와 상관없이 2줄
+                with st.expander(
+                    "🔧 괄호 예외 (선택) — 안 쳐도 정답, 쪼개도 정답인 괄호 고르기"
+                ):
+                    for title, key, options, tip in (
+                        (
+                            "안 쳐도 정답",
+                            "compose_br_omit",
+                            list(range(len(br_pairs))),
+                            None,
+                        ),
+                        (
+                            "쪼개도 정답",
+                            "compose_br_split",
+                            br_splittable,
+                            "단어 사이에서 나눠 여러 괄호로 쳐도 정답. 안에 다른 괄호가 없고 두 단어 이상인 괄호만 나옵니다.",
+                        ),
+                    ):
+                        if not options:
+                            continue
+                        col_name, col_pills = st.columns(
+                            [1, 5], vertical_alignment="center"
+                        )
+                        with col_name:
+                            st.caption(title, help=tip)
+                        with col_pills:
+                            st.pills(
+                                title,
+                                options,
+                                selection_mode="multi",
+                                format_func=lambda i: bracket_label(
+                                    sentence, i, br_pairs[i]
+                                ),
+                                key=key,
+                                label_visibility="collapsed",
+                            )
+
+        col_trans, col_note = st.columns([2, 1])
+        with col_trans:
+            st.text_input(
+                "해석 (예: 그것 때문에 교육은 매우 중요해진다.)", key="compose_trans"
+            )
+        with col_note:
+            st.text_input(
+                "채점 메모 (선택) — 이 문항만 특별히 볼 기준이 있을 때만 (예: 시제를 반드시 확인할 것)",
+                key="compose_note",
+            )
+        st.form_submit_button(
+            COMPOSE_ADD_LABEL, on_click=_compose_submit, key="compose_add_btn"
+        )
+
+    # 버튼을 누른 직후 한 번만 표시
+    for kind, text in ss.pop("compose_notice", None) or []:
+        getattr(st, kind)(text)
+
+
+def _guide_inline(text):
+    # 사용법 문구의 **굵게**·`코드` 표기를 HTML로 (그 밖의 글자는 그대로 보이도록 escape)
+    text = html.escape(text, quote=False)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+
+def render_guide_box(name, text):
+    """선생님 탭 '📖 사용법 보기' (결정 9): 아이보리·금색 선 접이 상자 + 이모지 칸·글 칸으로 나눈 줄
+    - 노란 박스(st.info)는 맨 앞 이모지를 아이콘 자리로 빼서 첫 줄만 튀어나오므로 직접 그림
+    - 문단(빈 줄로 구분)마다 맨 앞 이모지를 왼쪽 칸에, 나머지를 오른쪽 칸에"""
+    with st.container(key=f"guide_{name}"):
+        with st.expander("📖 사용법 보기"):
+            rows = []
+            for para in (p.strip() for p in text.split("\n\n")):
+                if not para:
+                    continue
+                icon, _, body = para.partition(" ")
+                rows.append(
+                    "<div class='guide-row'>"
+                    f"<span>{html.escape(icon)}</span>"
+                    f"<span>{_guide_inline(body)}</span></div>"
+                )
+            st.markdown("".join(rows), unsafe_allow_html=True)
+
 
 def render_ta_guideline_popover():
-    with st.popover("❔ 주요 TA 성분표"):
+    # 🧭 key 있는 칸에 넣어 CSS로 버튼만 네이비 + 골드 (펼친 성분표 내용은 흰 바탕 그대로)
+    with st.container(key="ta_popover"), st.popover("❔ 주요 TA 성분표"):
         st.markdown("""
         **[주어 / 동사류]**
         **S** / **가S** / **진S** / **Vi** / **Vl** / **Vt** / **Vd** / **VC** / **m.v**
@@ -1722,9 +2943,12 @@ def render_ta_guideline_popover():
         **O** / **IO** / **DO** / **p.o** / **SC** / **OC**
         
         **[수식어 및 기타]**
-        **adj** / **adv** / **prep** / **분구**
+        **adj** / **adv** / **prep** / **분구** / **N**
         
-        *(🚨 대소문자 무관. 복수 정답은 `분구(vt)` 형태로 자유롭게 기재)*
+        **[연결어]**
+        **△** 관계사 / **□** 접속사 *(버튼으로 표시)*
+        
+        *(🚨 대소문자 무관)*
         """)
 
 
@@ -1739,7 +2963,7 @@ if not st.session_state.started:
             """
         <div class="splash-container">
             <div class="main-title">SETE</div>
-            <div class="sub-title">TA 자동 채점 시스템 (Ver 1.3)</div>
+            <div class="sub-title">TA 자동 채점 시스템 (Ver 2.1)</div>
         </div>
         <div class="lsb-footer">made by LSB</div>
         """,
@@ -1777,15 +3001,26 @@ if st.session_state.role == "teacher_prompt":
         )
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            password = st.text_input(
-                "암호를 입력해 주십시오.", type="password", key="login_password_input"
-            )
-            if password:
-                if password == "1357":
-                    st.session_state.role = "teacher"
-                    st.rerun()
-                else:
-                    st.error("암호가 일치하지 않습니다.")
+            if not TEACHER_PASSWORD:
+                print(
+                    "[AUTH] TEACHER_PASSWORD 없음 → 선생님 로그인 차단 (점검 코드: PW-01)"
+                )
+                st.error(
+                    "🔑 선생님 암호 설정이 필요해요! 😥 이 화면을 캡처해서 개발자에게 보내 주세요 📸 (점검 코드: PW-01)"
+                )
+            else:
+                password = st.text_input(
+                    "암호를 입력해 주십시오.",
+                    type="password",
+                    key="login_password_input",
+                )
+                # 앞뒤 공백은 무시 (태블릿 자동완성 대비), 대소문자는 구분
+                if password:
+                    if password.strip() == TEACHER_PASSWORD:
+                        st.session_state.role = "teacher"
+                        st.rerun()
+                    else:
+                        st.error("암호가 일치하지 않습니다.")
             if st.button("뒤로 가기 🔙", key="login_back_button"):
                 st.session_state.role = None
                 st.rerun()
@@ -1809,95 +3044,34 @@ if st.session_state.role == "teacher":
     )
 
     with tab1:
-        st.info(
-            "👨‍🏫 **선생님 운영 가이드라인:** 이곳에서 새로운 문제를 한 문제씩 추가할 수 있습니다. 추가한 문제는 **출제 대기** 상태로 저장되며, [📁 DB 관리 및 출제] 탭에서 세트를 출제하면 학생 화면에 나타납니다.\n\n"
-            "✂️ **[구문 분석 문장]** 슬래시(`/`)로 칸을 나누고 괄호 `()`, `[]`로 구문을 묶어 주십시오. 학생 화면에는 기호가 모두 빠진 원문장이 보이며, 학생은 **나눈 위치와 괄호까지 정확해야** 정답입니다.\n\n"
-            "⚠️ **[원문장 확인]** 원문장과 구문 분석 문장의 단어(철자)가 똑같아야 합니다. 한 글자라도 다르면 학생이 그 문항을 맞힐 수 없으니 추가하기 전에 꼭 확인해 주십시오.\n\n"
-            "💡 **[복수 정답 허용]** `분구(vt)`처럼 괄호를 묶어 정답을 입력하면, 학생이 순서를 바꾸거나 띄어쓰기를 다르게 해도 모두 정답 처리합니다! 💯 TA 정답의 칸을 비워 두면(예: `prep / / S`) 학생도 그 칸을 비워야 정답입니다.\n\n"
-            "📝 **[채점 메모]** 이 문항만 특별히 봐야 할 해석 기준이 있다면 적어 주십시오. AI가 공통 채점 기준보다 메모를 먼저 따릅니다."
-        )
         col_t1, col_t2 = st.columns([4, 1])
         with col_t1:
             st.header("📝 문제 출제란")
         with col_t2:
             render_ta_guideline_popover()
 
-        with st.form("teacher_input_form"):
-            input_set_name = st.text_input(
-                "세트 이름 (예: Set 5)", value="수동 출제 세트"
-            )
-            # 💡 예시 문장 Set 1의 1번 문장으로 변경
-            input_raw = st.text_input(
-                "원문장 (학생 화면 노출용) (예: Because of that, education becomes very important.)"
-            )
-            input_sentence = st.text_input(
-                "구문 분석 문장 (예: (Because of / that), / education / becomes / very / important.)"
-            )
-            input_ta = st.text_input("TA 정답 (예: prep / / S / Vl / adv / SC)")
-            input_trans = st.text_input(
-                "해석 (예: 그것 때문에 교육은 매우 중요해진다.)"
-            )
-            input_note = st.text_input(
-                "채점 메모 (선택) — 이 문항만 특별히 볼 기준이 있을 때만 적어주세요. 비워도 됩니다. (예: 시제를 반드시 확인할 것)"
-            )
+        render_guide_box(
+            "compose",
+            "🧩 **[구문 분석 문장]** 슬래시(`/`)로 칸을 나누고 괄호 `()`, `[]`로 구문을 묶은 뒤 Enter를 누르면 아래에 칸이 만들어져요. 칸마다 TA 정답을 적어 주세요. 학생은 **나눈 위치와 괄호까지 정확해야** 정답입니다.\n\n"
+            "⚠️ **[원문장 확인]** 원문장은 구문 분석 문장에서 자동으로 만들어지고, '학생에게 보이는 문장'에서 확인할 수 있어요. 직접 정하고 싶을 때만 '원문장 직접 입력'을 열어 주세요. 단어(철자)가 다르면 추가되지 않고 다른 곳을 알려 드려요.\n\n"
+            "💡 **[복수 성분]** `분구(vt)`처럼 괄호로 묶으면 학생도 모두 써야 정답이에요. 순서·대소문자·띄어쓰기는 달라도 됩니다(`Vt(분구)`도 정답). 하나만 써도 정답으로 하려면 `분구|vt`처럼 세로선(`|`)으로 나눠 주세요(둘 다 써도 정답).\n\n"
+            "💯 **[투명 빈칸]** TA 칸을 비워 두면 학생도 그 칸을 비워야 정답이에요.\n\n"
+            "🔺 **[연결어 도형]** 관계사·접속사가 혼자 있는 칸(that, who, and 등)에는 `△ 관계사` `□ 접속사` 버튼이 나타나요. 한 번 더 누르면 해제됩니다. 도형을 하나라도 넣은 세트는 학생 화면에서 그 세트의 모든 후보 칸에 버튼이 보이고, 도형이 없는 세트는 지금과 같아요.\n\n"
+            "🔧 **[괄호 예외]** 칸 아래 '괄호 예외'를 펼치면 안 쳐도 정답인 괄호, 쪼개도 정답인 괄호를 고를 수 있어요. 쪼개기는 단어 사이에서만 인정되고, 학생에게는 따로 안내되지 않아요.\n\n"
+            "⚡ **[빠른 입력]** Tab 키로 다음 칸으로 넘어갈 수 있어요. TA를 `prep / / S / Vl`처럼 한 줄로 갖고 있다면 'TA 한 줄로 붙여넣기'로 한 번에 채울 수 있어요. 추가한 뒤에도 세트 이름이 그대로 남아 같은 세트를 이어서 출제하기 편해요.\n\n",
+        )
 
-            if st.form_submit_button("DB에 문제 추가하기 ➕"):
-                safe_raw = input_raw.strip()
-                safe_sentence = input_sentence.strip()
-                safe_ta = input_ta.strip()
-                safe_set = input_set_name.strip()
-                safe_trans = input_trans.strip()
-                safe_note = input_note.strip()
+        render_question_composer()
 
-                if (
-                    not safe_raw
-                    or not safe_sentence
-                    or not safe_ta
-                    or not safe_set
-                    or not safe_trans
-                ):
-                    st.error(
-                        "🚨 세트 이름, 원문장, 구문 분석 문장, TA 정답, 해석은 모두 입력해야 합니다."
-                    )
-                elif "/" not in safe_sentence or "/" not in safe_ta:
-                    st.error(
-                        "🚨 구문 분석 문장과 TA 정답에는 반드시 슬래시(/)가 포함되어야 합니다."
-                    )
-                else:
-                    chunks_count = len(safe_sentence.split("/"))
-                    ta_count = len(safe_ta.split("/"))
-
-                    if chunks_count != ta_count:
-                        st.error(
-                            f"🚨 슬래시(/) 구문 개수가 다릅니다. (문장: {chunks_count}개, TA: {ta_count}개)"
-                        )
-                    else:
-                        try:
-                            add_question(
-                                safe_raw,
-                                safe_sentence,
-                                safe_ta,
-                                safe_trans,
-                                safe_set,
-                                safe_note,
-                            )
-                            st.success(
-                                f"🎉 '{safe_set}' 세트에 성공적으로 추가되었습니다."
-                            )
-                        except Exception as e:
-                            print(f"[DB] 문제 추가 실패: {e}")
-                            st.error(
-                                "🚨 문제를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요."
-                            )
     with tab2:
         st.header("📊 성적 현황 및 상세 답안지")
-        st.info(
-            "📊 **성적 현황 가이드**\n"
-            "* 🗂️ **[시험 선택]** 위에서 시험(출제한 세트 묶음)을 고르면 그 시험의 성적만 보여요! 같은 세트 묶음을 다시 출제하면 이전 기록이 이어집니다.\n"
-            "* ✏️ **[점수 수정]** AI 판정이 애매하다면 아래 상세 답안지를 확인한 뒤 표의 오답 수를 고치고 저장하세요. 통과·진행·선생님 호출 상태는 자동으로 다시 계산됩니다! ✨ 고친 차수는 답안지에 ✏️ 표시가 남아요.\n"
-            "* 🗑️ **[기록 삭제]** 🗑️ 칸을 체크하고 저장하면 **이 시험의 해당 학생 기록만** 삭제돼요. 다른 시험 기록은 안전합니다.\n"
-            "* 🔄 **[재응시]** 학생을 골라 `재응시 허용`을 누르면 그 학생만 1차부터 다시 볼 수 있어요! 복습으로 같은 세트를 다시 낼 때는 `전체 재응시`를 사용하세요. 이전 기록은 상세 답안지에서 회차별로 확인할 수 있습니다. 📚\n"
-            "* 🔍 **[상세 답안지]** 학생이 구문을 어떻게 나눴는지, 칸별 결과(✅ 정답 / ❌ 오답 / ✂️ 나눈 위치가 다름), 괄호 오류, AI 판정 사유까지 한눈에 보여요! 지금 출제 중인 시험은 **제출 전 작성 중인 답안**도 볼 수 있습니다. 👀"
+        render_guide_box(
+            "records",
+            "🗂️ **[시험 선택]** 위에서 시험(출제한 세트 묶음)을 고르면 그 시험의 성적만 보여요! 같은 세트 묶음을 다시 출제하면 이전 기록이 이어집니다.\n\n"
+            "✏️ **[점수 수정]** AI 판정이 애매하다면 아래 상세 답안지를 확인한 뒤 표의 오답 수를 고치고 저장하세요. 통과·진행·선생님 호출 상태는 자동으로 다시 계산되고, 고친 차수는 답안지에 ✏️ 표시가 남아요.\n\n"
+            "🗑️ **[기록 삭제]** 🗑️ 칸을 체크하고 저장하면 **이 시험의 해당 학생 기록만** 삭제돼요. 다른 시험 기록은 안전합니다.\n\n"
+            "🔄 **[재응시]** 학생을 골라 `재응시 허용`을 누르면 그 학생만 1차부터 다시 볼 수 있어요! 복습으로 같은 세트를 다시 낼 때는 `전체 재응시`를 사용하세요. 이전 기록은 상세 답안지에서 회차별로 확인할 수 있습니다.\n\n"
+            "🔍 **[상세 답안지]** 학생이 구문을 어떻게 나눴는지, 칸별 결과(✅ 정답 / ❌ 오답 / ✂️ 나눈 위치가 다름), 괄호 오류, AI 판정 사유까지 한눈에 보여요! 지금 출제 중인 시험은 제출 전 작성 중인 답안도 볼 수 있습니다.",
         )
 
         # 저장·재응시 후 새로고침된 화면에서 결과 메시지를 한 번 표시
@@ -1954,7 +3128,9 @@ if st.session_state.role == "teacher":
                             icon = "✅"
                         else:
                             icon = "❌"
-                        parts.append(f"{icon} {html.escape(str(answers[input_key]))}")
+                        shape = str(answers.get(f"shape_{q_id}_{i}", "") or "")
+                        shown = f"{shape} {answers[input_key]}".strip()
+                        parts.append(f"{icon} {html.escape(shown)}")
                     ta_result_str = " / ".join(parts) if parts else "(미제출)"
                     if has_chunk_error:
                         ta_result_str += " <span style='color:#721c24; font-weight:normal;'>(✂️ = 나눈 위치가 정답과 다른 칸)</span>"
@@ -2250,13 +3426,14 @@ if st.session_state.role == "teacher":
 
     with tab3:
         st.header("📁 전체 DB 관리 및 세트 출제")
-        st.info(
-            "**📁 전체 DB 관리 및 세트 출제 가이드**\n"
-            "* **[원클릭 출제]** 세트(폴더)를 펼치고 `이 세트 출제하기` 체크박스를 켜면 즉시 학생들 화면에 시험지가 노출됩니다. 여러 세트를 함께 출제하면 **세트 순서대로**(Set 1 → Set 2 → … → Set 10) 묶여서 나옵니다.\n"
-            "* **[시험 구분]** 함께 출제한 세트 묶음이 하나의 시험이 됩니다. (예: `Set 1`과 `Set 1 + Set 2`는 서로 다른 시험) 같은 묶음을 다시 출제하면 이전 기록이 이어지고, **세트 이름을 바꾸면 다른 시험으로 기록**되니 주의해 주십시오. 🗂️\n"
-            "* **[맞춤형 해석 모드]** 우측의 `해석 출제 모드`를 변경하여 세트별로 요구하는 해석 기준(전체/핵심구/미출제)을 다르게 설정할 수 있습니다. ⚙️\n"
-            "* **[문제 수정·순서·삭제]** 표에서 내용을 바로 고치고, `순서` 칸으로 세트 안의 문제 순서를 정하고, 🗑️ 칸을 체크해 삭제할 수 있습니다. 원문장 칸을 비워 두고 저장하면 구문 분석 문장에서 자동으로 만들어집니다. ✍️\n"
-            "* 수정 후 아래 `저장` 버튼을 누르면 즉시 모든 변경사항이 반영됩니다! 💾 맨 아래 `📦 백업 파일 만들기`로 문제·성적·답안을 파일 하나로 내려받을 수 있으니, **일주일에 한 번** 백업해 두시길 권장합니다."
+        render_guide_box(
+            "db",
+            "🚀 **[원클릭 출제]** 세트(폴더)를 펼치고 `이 세트 출제하기`를 켜면 바로 학생 화면에 시험지가 나와요! 여러 세트를 함께 출제하면 세트 순서대로(Set 1 → Set 2 → … → Set 10) 묶여서 나옵니다.\n\n"
+            "🗂️ **[시험 구분]** 함께 출제한 세트 묶음이 하나의 시험이 돼요(예: `Set 1`과 `Set 1 + Set 2`는 서로 다른 시험). 같은 묶음을 다시 출제하면 이전 기록이 이어지고, ⚠️ 세트 이름을 바꾸면 다른 시험으로 기록되니 주의해 주세요.\n\n"
+            "⚙️ **[해석 모드]** 오른쪽 `해석 출제 모드`에서 세트마다 해석 기준(전체/핵심구/미출제)을 다르게 정할 수 있어요.\n\n"
+            "✍️ **[문제 수정·순서·삭제]** 표에서 내용을 바로 고치고, `순서` 칸으로 세트 안의 문제 순서를 정하고, 🗑️ 칸을 체크해 삭제할 수 있어요. 원문장 칸을 비워 두고 저장하면 구문 분석 문장에서 자동으로 만들어져요. 고친 문항에 칸 수·철자·괄호 짝 문제가 있으면 저장하지 않고 고칠 곳을 알려 드려요.\n\n"
+            "🔺 **[도형·괄호 예외]** TA 칸에 도형을 직접 쓸 때는 `△`, `△(S)`처럼 입력해요. '괄호 예외' 열은 보기 전용이라, 바꾸려면 그 문항을 삭제하고 문제 출제 탭에서 다시 추가해 주세요(세트 맨 뒤 순서로 들어가요). 구문 분석 문장의 괄호 순서가 바뀌면 그 문항의 괄호 예외는 해제돼요.\n\n"
+            "💾 **[저장·백업]** 고친 뒤 아래 `저장` 버튼을 누르면 모든 변경사항이 바로 반영돼요. 맨 아래 `📦 백업 파일 만들기`로 문제·성적·답안을 파일 하나로 내려받을 수 있으니, 일주일에 한 번 백업해 두시길 권장합니다.",
         )
         db_df = get_all_questions(only_active=False)
         if not db_df.empty:
@@ -2267,13 +3444,27 @@ if st.session_state.role == "teacher":
             )
 
             all_sets = db_df["set_name"].unique()
+            # 💡 저장에 성공할 때마다 번호를 바꿔 표·체크칸을 DB 내용으로 새로 그림
+            #    (예전 표의 🗑️ 체크·수정 기록이 행이 밀린 뒤 다른 문제에 붙지 않도록. 저장 실패 때는 고친 내용 유지)
+            editor_nonce = st.session_state.setdefault("db_editor_nonce", 0)
             all_edited_dfs = []
             set_active_states = {}
             set_trans_modes = {}  # 👉 [추가] 세트별 모드 저장용
 
             for s_name in all_sets:
                 set_df = db_df[db_df["set_name"] == s_name].copy()
-                is_set_active = bool(set_df["is_active"].sum() > 0)
+                active_flags = pd.to_numeric(
+                    set_df["is_active"], errors="coerce"
+                ).fillna(0)
+                is_set_active = bool(active_flags.sum() > 0)
+                # 💡 출제 중인 세트에 [📝 문제 출제] 탭으로 추가한 문제는 다음 저장 때 함께 출제됨 → 개수를 미리 표시
+                waiting_count = int((active_flags == 0).sum()) if is_set_active else 0
+                set_status = (
+                    "🟢 출제 중"
+                    + (f" · ⏳ 대기 {waiting_count}문제" if waiting_count else "")
+                    if is_set_active
+                    else "⚪ 대기 중"
+                )
 
                 # DB에서 현재 세트의 모드를 읽어옴 (첫 번째 문제 기준, 항상 표준값)
                 current_mode = (
@@ -2283,7 +3474,7 @@ if st.session_state.role == "teacher":
                 )
 
                 with st.expander(
-                    f"📁 [{s_name}] (총 {len(set_df)}문제) - {'🟢 출제 중' if is_set_active else '⚪ 대기 중'}"
+                    f"📁 [{s_name}] (총 {len(set_df)}문제) - {set_status}"
                 ):
                     # 👉 [UI 개선] 가로폭 비율 조정 (1.5 : 1) 및 시각적 균형 맞춤
                     col_chk, col_mode = st.columns([1.5, 1])
@@ -2291,7 +3482,7 @@ if st.session_state.role == "teacher":
                         set_active_states[s_name] = st.checkbox(
                             f"이 세트 출제하기",
                             value=is_set_active,
-                            key=f"chk_{s_name}",
+                            key=f"chk_{s_name}_{editor_nonce}",
                         )
                     with col_mode:
                         # 💡 선택값은 표준값(이모지 없음)으로 저장되고, 이모지는 화면 라벨로만 표시
@@ -2300,10 +3491,14 @@ if st.session_state.role == "teacher":
                             TRANS_MODES,
                             index=TRANS_MODES.index(current_mode),
                             format_func=lambda m: TRANS_MODE_LABELS[m],
-                            key=f"mode_{s_name}",
+                            key=f"mode_{s_name}_{editor_nonce}",
                             label_visibility="collapsed",
                         )
                     set_df["delete"] = False
+                    set_df["bracket_view"] = [
+                        bracket_rules_summary(s, r)
+                        for s, r in zip(set_df["sentence"], set_df["bracket_rules"])
+                    ]
 
                     # 💡 표에 띄울 데이터 목록에 'raw_sentence' 추가 및 순서 재배치
                     edited_df = st.data_editor(
@@ -2315,6 +3510,7 @@ if st.session_state.role == "teacher":
                                 "raw_sentence",
                                 "sentence",
                                 "answer_ta",
+                                "bracket_view",
                                 "answer_translation",
                                 "grading_note",
                                 "id",
@@ -2331,6 +3527,9 @@ if st.session_state.role == "teacher":
                             "raw_sentence": st.column_config.TextColumn("원문장"),
                             "sentence": st.column_config.TextColumn("구문 분석 문장"),
                             "answer_ta": st.column_config.TextColumn("TA"),
+                            "bracket_view": st.column_config.TextColumn(
+                                "괄호 예외", disabled=True
+                            ),
                             "answer_translation": st.column_config.TextColumn("해석"),
                             "grading_note": st.column_config.TextColumn(
                                 "채점 메모 (선택)"
@@ -2339,7 +3538,7 @@ if st.session_state.role == "teacher":
                         },
                         hide_index=True,
                         use_container_width=True,
-                        key=f"ed_{s_name}",
+                        key=f"ed_{s_name}_{editor_nonce}",
                     )
                     all_edited_dfs.append(edited_df)
             st.divider()
@@ -2349,27 +3548,50 @@ if st.session_state.role == "teacher":
                 "💾 모든 세트 변경사항 DB에 적용", type="primary", key="save_db_btn"
             ):
                 combined_df = pd.concat(all_edited_dfs, ignore_index=True)
+                cleared_rules = []
                 try:
-                    saved, deleted, skipped = update_db_from_combined(
-                        combined_df, set_active_states, set_trans_modes
+                    saved, deleted = update_db_from_combined(
+                        combined_df,
+                        set_active_states,
+                        set_trans_modes,
+                        cleared=cleared_rules,
                     )
+                except QuestionDataError as e:
+                    # 💡 검사에 걸리면 아무것도 저장하지 않고, 고친 내용은 표에 그대로 남김 (표 번호를 바꾸지 않음)
+                    st.session_state.db_save_notice = ("problems", e.problems)
                 except Exception as e:
                     print(f"[DB] 문제 DB 저장 실패: {e}")
-                    st.error(
-                        "🚨 저장하지 못했습니다. 바뀐 내용은 하나도 반영되지 않았으니, 잠시 후 다시 저장해 주세요."
-                    )
+                    st.session_state.db_save_notice = ("error", None)
                 else:
-                    st.success(
-                        f"데이터베이스 성공적 업데이트! (수정 {saved}개, 삭제 {deleted}개 반영 완료) 🌟"
-                    )
-                    if skipped:
-                        st.warning(
-                            f"⚠️ 구문 분석 문장이나 TA가 비어 있는 {skipped}개 문항은 저장하지 않고 이전 내용을 그대로 두었습니다."
+                    ok_text = f"✅ {datetime.now(KST).strftime('%H:%M')} 저장 완료! (수정 {saved}개, 삭제 {deleted}개 반영) 🌟"
+                    if cleared_rules:
+                        ok_text += "\n\n⚠️ 구문 분석 문장의 괄호가 바뀌어 괄호 예외가 해제된 문항: " + ", ".join(
+                            cleared_rules
                         )
-
-                    # 💡 5초 동안 화면을 대기시켜 성공 메시지를 유지한 뒤 새로고침
-                    time.sleep(5)
+                    st.session_state.db_save_notice = ("ok", ok_text)
+                    st.session_state.db_editor_nonce = editor_nonce + 1
                     st.rerun()
+
+            # 💡 저장 결과는 다음에 저장 버튼을 누를 때까지 계속 표시
+            #    (예전 5초 대기 대신: 화면이 멈추지 않고, 칸을 고치는 동안 고칠 곳 목록도 사라지지 않음)
+            notice_kind, notice_body = st.session_state.get("db_save_notice") or (
+                None,
+                None,
+            )
+            if notice_kind == "ok":
+                st.success(notice_body)
+            elif notice_kind == "problems":
+                st.error(
+                    "🚨 저장하지 않았습니다. 아래 문항을 고친 뒤 다시 저장해 주십시오. (고친 내용은 표에 그대로 남아 있습니다)\n\n"
+                    + "\n".join(
+                        f"* **{label}** — {' / '.join(msgs)}"
+                        for label, msgs in notice_body
+                    )
+                )
+            elif notice_kind == "error":
+                st.error(
+                    "🚨 저장하지 못했습니다. 바뀐 내용은 하나도 반영되지 않았으니, 잠시 후 다시 저장해 주세요."
+                )
 
         # 💾 전체 백업 (문제·성적·답안·임시저장을 파일 하나로)
         st.divider()
@@ -2407,6 +3629,10 @@ if st.session_state.role == "teacher":
 
     with tab4:
         st.header("💡 시스템 Insight")
+        st.info(
+            "💡 화면만 봐서는 알 수 없는 채점·기록 원리 모음입니다. (사용법은 각 탭 위쪽의 '📖 사용법 보기')"
+        )
+        st.write("<br>", unsafe_allow_html=True)
 
         st.markdown("""
         ### 1. 🎯 채점 원리
@@ -2417,7 +3643,11 @@ if st.session_state.role == "teacher":
         
         *   **칸별 부분 채점:** 잘못 나눈 칸만 ✂️로 표시하고, 올바르게 나눈 칸은 성분을 따로 채점합니다. 학생은 어디서 틀렸는지 정확히 알 수 있습니다.
         
-        *   **괄호:** 위치와 개수가 정확해야 합니다. 단, 선생님이 연달아 친 괄호(`(A) (B)`)는 학생이 하나로 묶어도(`(A B)`) 정답입니다. 괄호를 쪼개거나 빼거나 더하면 **'괄호 오류'**로 그 문항은 오답이 됩니다.
+        *   **괄호:** 위치와 개수가 정확해야 합니다. 단, 선생님이 연달아 친 괄호(`(A) (B)`)는 학생이 하나로 묶어도(`(A B)`) 정답입니다. 괄호를 쪼개거나 빼거나 더하면 '**괄호 오류**'로 그 문항은 오답이 됩니다.
+        
+        *   **괄호 예외:** 선생님이 출제란 '괄호 예외'에서 고른 괄호만 생략(통째로 빼기)이나 쪼개기(단어 사이에서만)를 정답으로 인정합니다. 학생에게는 따로 안내하지 않습니다.
+        
+        *   **연결어 도형:** △/□ 버튼은 정답과 상관없이 후보 단어(that, who, and 등)가 혼자 있는 칸마다 나타나므로, 버튼 위치가 정답 힌트가 되지 않습니다. 도형 칸은 학생이 성분을 비워도 도형만 맞으면 정답이며, 성분을 쓰면 그 성분도 맞아야 합니다.
         
         *   **AI 해석 채점:** 선생님과 함께 정한 채점 기준에 따라 채점합니다. 사소한 맞춤법·유의어는 인정하고 치명적인 오역은 오답 처리하며, **'핵심구 해석'** 모드에서는 핵심 어구만 들어 있으면 통과입니다. 채점 연결이 잠시 불안정하면 자동으로 다시 시도합니다.
         """)
@@ -2433,7 +3663,7 @@ if st.session_state.role == "teacher":
         
         *   **제출 전 괄호 안내:** 괄호 짝이 안 맞거나 괄호가 정답과 다르면 제출 전에 안내 문구가 떠서, 학생이 스스로 다시 확인할 수 있습니다. **어디가 틀렸는지는 알려주지 않습니다.**
         
-        *   **채점 결과 표시:** 채점 후 칸마다 ✅ / ❌ / ✂️가 표시됩니다. 학생이 고친 칸은 **'✏️ 수정됨'**으로 바뀌어, 다시 제출할 부분을 스스로 파악할 수 있습니다.
+        *   **채점 결과 표시:** 채점 후 칸마다 ✅ / ❌ / ✂️가 표시됩니다. 학생이 고친 칸은 '**✏️ 수정됨**'으로 바뀌어, 다시 제출할 부분을 스스로 파악할 수 있습니다.
         
         *   **태블릿·PC 최적화:** 화면 폭에 맞춰 나뉜 구문이 알아서 줄바꿈되어, 아이패드에서도 찌그러지지 않습니다.
         """)
@@ -2449,7 +3679,7 @@ if st.session_state.role == "teacher":
         
         *   **제출 당시 그대로의 답안지:** 답안지는 학생이 제출한 **그 순간의 문제 기준**으로 보관됩니다. 나중에 문제를 고치거나 지워도 옛 답안지는 바뀌지 않습니다.
         
-        *   **자동 복구:** 창을 닫았다가 이름을 다시 입력하면 최근 임시저장·제출 답안이 복구됩니다. 선생님이 출제 세트를 바꾸면 학생 화면이 새 시험으로 자동 전환되고, 쓰던 답안은 이전 시험에 보관됩니다.
+        *   **자동 복구:** 입력 중인 답안은 약 1분 간격으로 자동 임시저장되어, 태블릿 화면이 꺼지거나 새로고침되어도 대부분 되살아납니다. 창을 닫았다가 이름을 다시 입력하면 최근 임시저장·제출 답안이 복구됩니다.
         
         *   **제출 안전장치:** 채점 전에 답안을 먼저 저장합니다. 채점이나 저장에 실패하면 **시도 횟수와 성적이 바뀌지 않으며**, 같은 답안이 두 번 제출되는 일도 막아 줍니다.
         
@@ -2545,8 +3775,10 @@ elif st.session_state.role == "student":
             "🎓 **학생 응시 가이드라인:** 원문장을 읽고, 아래 입력창에서 슬래시(`/`)로 구문을 나누고 성분을 채우십시오.\n\n"
             "🧩 **[스마트 입력창]** 문장이 길어도 자동으로 줄바꿈이 됩니다. 엔터를 쳐도 화면이 튕기지 않으니 편하게 작성하십시오. ✍️\n\n"
             "✂️ **[구문 나누기]** 슬래시는 띄어쓰기 앞뒤 어디에 쳐도 괜찮지만, **나눈 위치가 정확해야** 정답입니다. 원문의 단어를 지우거나 바꾸면 제출할 수 없습니다.\n\n"
+            "🏷️ **[성분 쓰기]** 한 칸에 성분이 둘 이상이면 `adv(Vt)`처럼 괄호로 함께 쓰십시오. **모두 써야 정답**이며, 순서와 대소문자는 상관없습니다.\n\n"
+            "🔺 **[연결어 표시]** 칸 아래에 `△ 관계사` `□ 접속사` 버튼이 보이면, 관계사 칸은 △, 접속사 칸은 □를 누르십시오. 다시 누르면 해제됩니다. 버튼이 있다고 모두 연결어는 아니므로, 연결어가 아니면 누르지 마십시오. 표시가 틀리거나 빠지면 그 칸은 오답입니다.\n\n"
             "👻 **[기호 및 빈칸]** 괄호 `()`, `[]`는 짝과 위치를 정확히 맞추십시오. 괄호가 틀려도 성분과 해석은 먼저 쓸 수 있지만, **그대로 제출하면 그 문항은 오답**입니다. 채울 성분이 없는 투명 빈칸은 그대로 비워두고 제출하십시오.\n\n"
-            "✌️ **[중간저장 활용]** 튕김 방지를 위해 왼쪽 사이드바의 `💾 임시저장` 버튼을 틈틈이 눌러주십시오!"
+            "✌️ **[중간저장 활용]** 입력하는 동안 답안이 약 1분 간격으로 자동 저장됩니다. 자리를 비우거나 태블릿을 끄기 전에는 왼쪽 사이드바의 `💾 임시저장` 버튼을 한 번 더 눌러주십시오!"
         )
         if "전체 해석" in active_modes:
             guide_text += "\n\n📝 **[전체 해석]** 뜻이 통하면 자연스럽게 써도 됩니다! 단, 문장의 일부만 쓰면 오답입니다."
@@ -2589,7 +3821,7 @@ elif st.session_state.role == "student":
         with st.sidebar:
             st.markdown("### 💾 임시저장")
             if st.button(
-                "현재까지 풀이 저장", type="secondary", use_container_width=True
+                "현재까지 풀이 저장", type="primary", use_container_width=True
             ):
                 # 화면에 떠있는 최신 입력값을 강제 수집 (제출 전 선저장과 같은 함수 사용)
                 draft_dict = collect_current_answers()
@@ -2598,6 +3830,7 @@ elif st.session_state.role == "student":
                     save_student_draft(
                         st.session_state.student_name, exam_key, draft_dict
                     )
+                    remember_saved_answers(draft_dict)
                     st.success("✅ 임시저장 완료! (창을 닫아도 복구됩니다)")
                 except Exception as e:
                     print(f"[DB] 임시저장 실패: {e}")
@@ -2605,6 +3838,7 @@ elif st.session_state.role == "student":
 
         local_inputs = {}
         total_questions = len(active_questions_df)
+        shape_sets = shape_set_names(active_questions_df.to_dict("records"))
 
         for idx, row in active_questions_df.iterrows():
             q_id = row["id"]
@@ -2668,7 +3902,8 @@ elif st.session_state.role == "student":
                     )
 
             # 👉 TA 입력칸 값 준비 (슬래시를 넣거나 빼면 내용이 같은 칸의 태그를 따라 옮겨줌)
-            prepare_ta_inputs(q_id, structure["chunks"])
+            shapes_on = shapes_enabled(row, shape_sets)
+            prepare_ta_inputs(q_id, structure["chunks"], shapes_on)
             chunks = structure["display_chunks"]
 
             # 👉 [UI 최적화] 10인치 태블릿 + PC 모두 대응하는 동적 그리드 로직
@@ -2709,6 +3944,12 @@ elif st.session_state.role == "student":
                         input_key = f"ta_{q_id}_{original_i}"
                         widget_key = f"input_ta_{q_id}_{original_i}"
                         default_val = st.session_state.user_inputs.get(input_key, "")
+                        # 🔺 연결어 도형 버튼 (도형을 쓰는 세트에서, 후보 단어가 혼자 있는 칸에만)
+                        shape_key = f"shape_{q_id}_{original_i}"
+                        shape_widget_key = f"input_shape_{q_id}_{original_i}"
+                        has_shape_button = shapes_on and connector_candidate(
+                            structure["chunks"][original_i]
+                        )
 
                         if input_key in st.session_state.feedback:
                             # 💡 제출 때와 같은 값일 때만 채점 결과 표시, 고친 칸은 '수정됨'으로 표시
@@ -2727,7 +3968,20 @@ elif st.session_state.role == "student":
                                 .lower()
                             )
                             feedback_val = st.session_state.feedback[input_key]
-                            if not chunk_unchanged or current_val != submitted_val:
+                            current_shape = (
+                                st.session_state.get(shape_widget_key) or ""
+                                if has_shape_button
+                                else ""
+                            )
+                            submitted_shape = str(
+                                st.session_state.submitted_answers.get(shape_key, "")
+                                or ""
+                            )
+                            if (
+                                not chunk_unchanged
+                                or current_val != submitted_val
+                                or current_shape != submitted_shape
+                            ):
                                 st.markdown(
                                     "<div class='fb-edit'>✏️ 수정됨</div>",
                                     unsafe_allow_html=True,
@@ -2754,6 +4008,15 @@ elif st.session_state.role == "student":
                             label_visibility="collapsed",
                         )
                         local_inputs[input_key] = val
+                        if has_shape_button:
+                            shape_val = st.segmented_control(
+                                f"{original_i + 1}번째 칸 연결어 표시",
+                                SHAPES,
+                                format_func=SHAPE_LABELS.get,
+                                key=shape_widget_key,
+                                label_visibility="collapsed",
+                            )
+                            local_inputs[shape_key] = shape_val or ""
 
             # 👉 해석 칸은 구문 나누기·괄호 상태와 상관없이 항상 표시 (입력값이 사라지지 않도록)
             trans_key = f"trans_{q_id}"
@@ -2837,9 +4100,11 @@ elif st.session_state.role == "student":
 
             # 💾 AI를 부르기 전에 현재 답안을 DB에 먼저 저장 (채점 중 창이 닫혀도 복구 가능)
             try:
+                presubmit_answers = collect_current_answers()
                 save_student_draft(
-                    st.session_state.student_name, exam_key, collect_current_answers()
+                    st.session_state.student_name, exam_key, presubmit_answers
                 )
+                remember_saved_answers(presubmit_answers)
             except Exception as e:
                 print(f"[DB] 제출 전 저장 실패: {e}")
                 st.error(
@@ -2861,16 +4126,23 @@ elif st.session_state.role == "student":
                         active_questions_df, local_inputs, chunk_inputs
                     )
                 except GradingError as e:
-                    grading_error = str(e)
+                    grading_error = e
 
             if grading_error is not None:
                 # ❗ 채점 실패: 성적·차수는 그대로, 화면의 답안도 그대로 유지
-                st.error(
-                    "🚨 채점 서버 연결이 원활하지 않습니다. 답안은 안전하게 저장되었으니, 잠시 후 다시 제출해 주세요. (시도 횟수는 차감되지 않았습니다)"
+                code_text = grading_error.check_code + (
+                    f"·{grading_error.detail}" if grading_error.detail else ""
                 )
-                st.caption(f"오류 정보: {grading_error}")
+                if grading_error.check_code == "AI-02":
+                    # 일시 장애 → 다시 제출하면 될 가능성이 큼
+                    fail_msg = "🚨 채점 서버 연결이 원활하지 않습니다. 답안은 안전하게 저장되었으니 잠시 후 다시 제출해 주십시오. 계속 제출되지 않으면 선생님께 알려 주십시오. (시도 횟수는 차감되지 않았습니다)"
+                else:
+                    # 결제·키·모델 설정 문제 → 다시 제출해도 소용없으므로 선생님께 알림
+                    fail_msg = "🚨 지금은 채점 서비스에 문제가 있어 제출할 수 없습니다. 답안은 안전하게 저장되었으니 선생님께 이 화면을 알려 주십시오. (시도 횟수는 차감되지 않았습니다)"
+                st.error(f"{fail_msg} (점검 코드: {code_text})")
                 st.toast(
-                    "채점이 완료되지 않았습니다. 잠시 후 다시 제출해 주세요.", icon="⚠️"
+                    "채점이 완료되지 않았습니다. 화면의 안내를 확인해 주십시오.",
+                    icon="⚠️",
                 )
                 st.stop()
 
@@ -2905,3 +4177,8 @@ elif st.session_state.role == "student":
             st.session_state.attempt = attempt_from_status(new_status)
 
             st.rerun()
+
+        # 💾 [S2] 입력 중 자동 임시저장 (화면을 다 그린 뒤 실행 → 학생은 저장을 기다리지 않음)
+        run_student_autosave(st.session_state.student_name, exam_key)
+        if st.session_state.get("autosave_time_text"):
+            st.sidebar.caption(f"💾 자동 저장됨 {st.session_state.autosave_time_text}")
