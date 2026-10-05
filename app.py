@@ -2225,18 +2225,23 @@ st.markdown(
     .stDataFrame { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     .splash-container { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 70vh; }
     
-    /* ✨ 1. 메인 타이틀 및 모드 선택: 샴페인 골드 + 빛이 지나가는 반짝임 (B안) */
-    .main-title { font-size: 4.5rem; font-weight: 900; margin-bottom: 10px; letter-spacing: 1px;
-                  background: linear-gradient(115deg, #8F7130 0%, #BF9B45 28%, #EBDCAE 46%, #F8F0D8 50%, #EBDCAE 54%, #BF9B45 72%, #8F7130 100%);
-                  background-size: 260% 100%; animation: sete-shine 3.2s ease-in-out infinite;
-                  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
-    .mode-title { text-align: center; margin-top: 100px; font-weight: 800; font-size: 2.5rem;
-                  background: linear-gradient(115deg, #8F7130 0%, #BF9B45 28%, #EBDCAE 46%, #F8F0D8 50%, #EBDCAE 54%, #BF9B45 72%, #8F7130 100%);
-                  background-size: 260% 100%; animation: sete-shine 3.2s ease-in-out infinite;
-                  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
-    /* 반짝임: 3.2초마다 빛 띠가 오른쪽에서 왼쪽으로 한 번 지나감 (기기에서 '동작 줄이기'를 켜면 멈춘 채 가운데에 빛) */
-    @keyframes sete-shine { 0% { background-position: 100% 0; } 60%, 100% { background-position: 0% 0; } }
-    @media (prefers-reduced-motion: reduce) { .main-title, .mode-title { animation: none; background-position: 50% 0; } }
+    /* ✨ 1. 메인 타이틀 및 모드 선택: 샴페인 골드(고정) + 빛 띠가 지나가는 반짝임 */
+    .main-title, .mode-title {
+        width: fit-content; margin-left: auto; margin-right: auto;
+        position: relative; overflow: hidden;
+        background: linear-gradient(115deg, #8F7130 0%, #BF9B45 35%, #D9BF72 50%, #BF9B45 65%, #8F7130 100%);
+        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+    .main-title { font-size: 4.5rem; font-weight: 900; margin-bottom: 10px; letter-spacing: 1px; }
+    .mode-title { text-align: center; margin-top: 100px; font-weight: 800; font-size: 2.5rem; }
+    /* 반짝임 (사용자 확정): 빛 띠가 1.5초 동안 왼쪽→오른쪽으로 훑고 3.5초 쉼.
+       금색은 움직이지 않아 끊김이 없고, 위치 이동(transform)만 써서 아이패드·모바일에서도 동작.
+       기기의 '동작 줄이기' 설정과 관계없이 항상 반짝임 */
+    .main-title::after, .mode-title::after {
+        content: ""; position: absolute; top: 0; left: 0; width: 45%; height: 100%; pointer-events: none;
+        background: linear-gradient(100deg, rgba(255,250,235,0) 0%, rgba(255,250,235,0.85) 50%, rgba(255,250,235,0) 100%);
+        mix-blend-mode: screen; transform: translateX(-110%);
+        animation: sete-shine 5s ease-in-out infinite; }
+    @keyframes sete-shine { 0% { transform: translateX(-110%); } 30%, 100% { transform: translateX(230%); } }
     
     /* 🪨 서브타이틀 및 푸터: 슬레이트 그레이 (네이비·골드 테마와 조화) */
     .sub-title { font-size: 1.8rem; color: #5A6478; font-weight: 600; margin-bottom: 50px; }
@@ -2252,53 +2257,47 @@ st.markdown(
     .fb-fail { background-color:#f8d7da; color:#721c24; padding: 5px; border-radius:5px; text-align: center; font-weight: bold; }
     .fb-edit { background-color:#F1F5F9; color:#475569; padding: 5px; border-radius:5px; text-align: center; font-weight: bold; }
 
-    /* ✨ 3. 버튼 테마 오버라이딩 (B안: 네이비 + 골드 글씨) */
-    .stButton > button[kind="primary"] {
-        background: #1E2B45 !important;
-        color: #E3C77A !important;
-        border: none !important;
+    /* ✨ 3. 버튼 테마 (v16 최종): 주요 버튼 = 샴페인 바탕 + 금색 테두리 + 잉크 글씨 / 보조 버튼 = 흰 바탕 + 회색 테두리
+       주요 버튼: type="primary" 버튼 전부(시작·제출·임시저장·선생님 저장) + 'DB에 문제 추가하기'·'주요 TA 성분표'(key 이름표) */
+    .stButton > button[kind="primary"],
+    [class*="st-key-compose_add_btn"] button,
+    [class*="st-key-ta_popover"] button {
+        background: #F2E6C4 !important;
+        border: 1px solid #C9A64F !important;
         font-weight: bold !important;
     }
-    .stButton > button[kind="primary"]:hover {
-        background: #2B3C5E !important;
+    .stButton > button[kind="primary"]:hover,
+    [class*="st-key-compose_add_btn"] button:hover,
+    [class*="st-key-ta_popover"] button:hover {
+        background: #EBDBAA !important;
+    }
+    .stButton > button[kind="primary"], .stButton > button[kind="primary"] *,
+    [class*="st-key-compose_add_btn"] button, [class*="st-key-compose_add_btn"] button *,
+    [class*="st-key-ta_popover"] button, [class*="st-key-ta_popover"] button * {
+        color: #2A3346 !important;
     }
     .stButton > button[kind="secondary"] {
-        border: 1px solid #C2A250 !important;
-        color: #8A6D2A !important;
-        background-color: transparent !important;
+        border: 1px solid #D0D3D9 !important;
+        color: #2A3346 !important;
+        background-color: #FFFFFF !important;
         font-weight: bold !important;
     }
     .stButton > button[kind="secondary"]:hover {
-        background-color: #F6F7FA !important;
-        border-color: #8A6D2A !important;
-        color: #6F5720 !important;
+        border-color: #C9A64F !important;
+        color: #8A6D2A !important;
     }
+    /* 누를 수 없는 버튼(제출 조건 미충족·재응시 대상 미선택 등)은 흐리게 */
+    .stButton > button:disabled { opacity: 0.45 !important; cursor: not-allowed !important; }
 
-    /* 🧭 포인트 버튼 (네이비 + 골드): 출제란 'DB에 문제 추가하기', '주요 TA 성분표'(선생님·학생). 펼친 성분표 내용은 흰 바탕 그대로 */
-    [class*="st-key-compose_add_btn"] button,
-    [class*="st-key-ta_popover"] button {
-        background: #1E2B45 !important;
-        border: none !important;
-    }
-    [class*="st-key-compose_add_btn"] button:hover,
-    [class*="st-key-ta_popover"] button:hover {
-        background: #2B3C5E !important;
-    }
-    [class*="st-key-compose_add_btn"] button, [class*="st-key-compose_add_btn"] button *,
-    [class*="st-key-ta_popover"] button, [class*="st-key-ta_popover"] button * {
-        color: #E3C77A !important;
-        font-weight: bold !important;
-    }
-
-    /* 📖 선생님 탭 '사용법 보기' 상자 (A안): 제목 줄 = 버튼과 같은 네이비 띠 + 금색 글씨, 펼친 본문 = 흰 바탕 */
+    /* 📖 선생님 탭 '사용법 보기' 상자: 제목 줄 = 잉크 네이비 띠 + 금색 글씨, 펼친 본문 = 흰 바탕 */
     [class*="st-key-guide_"] [data-testid="stExpander"] details {
         background-color: #FFFFFF !important;
-        border: 1px solid #1E2B45 !important;
+        border: 1px solid #2A3346 !important;
         border-radius: 8px !important;
         overflow: hidden !important;
     }
     [class*="st-key-guide_"] [data-testid="stExpander"] summary {
-        background-color: #1E2B45 !important;
+        background-color: #2A3346 !important;
     }
     [class*="st-key-guide_"] [data-testid="stExpander"] summary,
     [class*="st-key-guide_"] [data-testid="stExpander"] summary * {
@@ -2971,7 +2970,9 @@ if not st.session_state.started:
         )
         col1, col2, col3 = st.columns([1, 1, 1])
         with col2:
-            if st.button("화면을 클릭하여 시작하기 🚀", use_container_width=True):
+            if st.button(
+                "화면을 클릭하여 시작하기 🚀", type="primary", use_container_width=True
+            ):
                 st.session_state.started = True
                 st.rerun()
     st.stop()
