@@ -326,6 +326,16 @@ def _tag_parts(tag_text):
     return set(p for p in parts if p)
 
 
+# 👆 [G-1] 학생 성분 판 버튼 (묶음 제목, 성분들) — '❔ 주요 TA 성분표'와 같은 묶음·순서 (테스트로 일치 확인)
+#    버튼 글자 = 칸에 들어가는 글자 = 타자로 쓰는 글자 (채점은 타자와 똑같음)
+TA_PICK_GROUPS = (
+    ("주어 · 동사", ("S", "가S", "진S", "Vi", "Vl", "Vt", "Vd", "VC", "m.v")),
+    ("목적어 · 보어", ("O", "IO", "DO", "p.o", "SC", "OC")),
+    ("수식어 · 기타", ("adj", "adv", "prep", "분구", "N")),
+)
+TA_TYPE_LABEL = "⌨️ 직접 쓰기 (성분이 두 개 이상일 때)"
+
+
 # [F12] 연결어 도형: △ = 관계사, □ = 접속사
 SHAPES = ("△", "□")
 SHAPE_LABELS = {"△": "△ 관계사", "□": "□ 접속사"}
@@ -1691,7 +1701,8 @@ def _ensure_result_row(t, name, exam_key):
 def load_student_exam(name, exam_key):
     """학생이 들어오거나 시험이 바뀌었을 때 불러올 값.
     답안: 임시저장이 있으면 임시저장(항상 마지막 제출보다 최신), 없으면 마지막 제출 답안
-    채점 표시: 이번 회차의 마지막 제출 결과"""
+    채점 표시: 이번 회차의 마지막 제출 결과
+    🔄 [재응시] 이번 회차에 아직 제출이 없으면 지난 회차의 마지막 제출(답안·채점 표시)을 이어받음"""
     with _db().transaction() as t:
         res = t.one(
             "SELECT round_no, status FROM results WHERE student_name = :n AND exam_key = :e",
@@ -1704,6 +1715,18 @@ def load_student_exam(name, exam_key):
             "WHERE student_name = :n AND exam_key = :e AND round_no = :r "
             "ORDER BY attempt_no DESC LIMIT 1",
             {"n": name, "e": exam_key, "r": round_no},
+        )
+        if not last and round_no > 1:
+            last = t.one(
+                "SELECT answers_json, feedback_json FROM attempts "
+                "WHERE student_name = :n AND exam_key = :e AND round_no < :r "
+                "ORDER BY round_no DESC, attempt_no DESC LIMIT 1",
+                {"n": name, "e": exam_key, "r": round_no},
+            )
+        counts = t.all(
+            "SELECT round_no, COUNT(*) AS c FROM attempts "
+            "WHERE student_name = :n AND exam_key = :e GROUP BY round_no",
+            {"n": name, "e": exam_key},
         )
         draft = t.one(
             "SELECT answers_json FROM drafts WHERE student_name = :n AND exam_key = :e",
@@ -1726,6 +1749,7 @@ def load_student_exam(name, exam_key):
         "answers": answers,
         "feedback": feedback,
         "submitted": submitted,
+        "retake_base": retake_base(round_no, {r["round_no"]: r["c"] for r in counts}),
     }
 
 
@@ -1857,6 +1881,35 @@ def status_label(status):
     return f"🏃 {attempt_from_status(status)}차 응시 대기"
 
 
+def retake_base(round_no, round_counts):
+    # 🔄 [재응시] 지금 회차 앞의 재응시 제출 수 (원래 회차면 None)
+    #    재응시 번호 = 원래 회차(1회차) 뒤의 제출을 순서대로 센 번호 → 지금 회차 n차 = 재응시(이 값 + n)
+    #    round_counts = {회차: 그 회차 제출 수} (실제 제출 수로 세므로 예전 방식 기록이 섞여도 번호가 이어짐)
+    round_no = int(round_no or 1)
+    if round_no <= 1:
+        return None
+    return sum(int(c) for r, c in round_counts.items() if 1 < int(r) < round_no)
+
+
+def attempt_label(attempt, base):
+    # 🔄 [재응시] 학생 화면·제출 버튼의 차수 이름: 원래 회차 '2차' / 재응시 중 '재응시5'
+    return f"{attempt}차" if base is None else f"재응시{base + attempt}"
+
+
+def record_status_label(status, round_no, round_counts):
+    # 🔄 [재응시] 성적 표 상태: 원래 회차는 예전 그대로, 재응시 중이면 '재응시n 응시 대기' / '3+n차 PASS'
+    base = retake_base(round_no, round_counts)
+    if base is None:
+        return status_label(status)
+    status = status or "PROGRESS"
+    if status.startswith("PASS_"):
+        first = int(round_counts.get(1, 0))
+        return f"🎉 {first}+{base + attempt_from_status(status)}차 PASS"
+    if status == "FAIL":
+        return "🚨 선생님 호출"
+    return f"🏃 재응시{base + attempt_from_status(status)} 응시 대기"
+
+
 def list_exam_keys():
     # 기록이 있는 시험 목록 (최근에 활동한 시험부터)
     with _db().transaction() as t:
@@ -1880,11 +1933,19 @@ def get_exam_records(exam_key):
             "FROM attempts WHERE exam_key = :e",
             {"e": exam_key},
         )
-    by_round = {}
+    by_round, counts = {}, {}
     for a in attempts:
         by_round.setdefault((a["student_name"], a["round_no"]), {})[a["attempt_no"]] = a
+        per = counts.setdefault(a["student_name"], {})
+        per[a["round_no"]] = per.get(a["round_no"], 0) + 1
     return [
-        dict(r, attempts=by_round.get((r["student_name"], r["round_no"]), {}))
+        dict(
+            r,
+            attempts=by_round.get((r["student_name"], r["round_no"]), {}),
+            round_counts=counts.get(
+                r["student_name"], {}
+            ),  # 🔄 [재응시] {회차: 제출 수}
+        )
         for r in results
     ]
 
@@ -1937,31 +1998,32 @@ def delete_exam_records(exam_key, names):
 
 
 def reset_exam(exam_key, names=None):
-    """재응시 허용: 회차를 1 올려 1차부터 다시 응시 (이전 회차 기록은 보관, 임시저장은 비움).
-    names=None이면 이 시험의 전체 학생. 현재 회차에 제출 기록이 없는 학생은 그대로 둠.
+    """🔄 재응시 허용: 선생님 호출(FAIL) 학생만 회차를 1 올려 3번 더 풀게 함.
+    새 회차는 지난 회차의 마지막 제출 답안·채점 표시를 이어받음(load_student_exam). 이전 기록은 보관, 임시저장은 비움.
+    names=None이면 이 시험의 FAIL 학생 전체. FAIL이 아닌 학생은 그대로 둠(그 사이 상태가 바뀐 경우 포함).
     반환: 실제로 재응시 처리한 학생 수"""
     now = now_kst()
     with _db().transaction() as t:
-        submitted = {
+        failed = {
             r["student_name"]
             for r in t.all(
-                "SELECT DISTINCT a.student_name FROM attempts a JOIN results r "
-                "ON a.student_name = r.student_name AND a.exam_key = r.exam_key "
-                "AND a.round_no = r.round_no WHERE a.exam_key = :e",
+                "SELECT student_name FROM results WHERE exam_key = :e AND status = 'FAIL'",
                 {"e": exam_key},
             )
         }
-        targets = sorted(submitted if names is None else submitted & set(names))
-        t.many(
-            "UPDATE results SET round_no = round_no + 1, status = 'PROGRESS', updated_at = :now "
-            "WHERE student_name = :n AND exam_key = :e",
-            [{"n": n, "e": exam_key, "now": now} for n in targets],
-        )
+        targets = sorted(failed if names is None else failed & set(names))
+        done = 0
+        for n in targets:
+            done += t.count(
+                "UPDATE results SET round_no = round_no + 1, status = 'PROGRESS', updated_at = :now "
+                "WHERE student_name = :n AND exam_key = :e AND status = 'FAIL'",
+                {"n": n, "e": exam_key, "now": now},
+            )
         t.many(
             "DELETE FROM drafts WHERE student_name = :n AND exam_key = :e",
             [{"n": n, "e": exam_key} for n in targets],
         )
-    return len(targets)
+    return done
 
 
 def get_student_attempts(name, exam_key):
@@ -2051,6 +2113,7 @@ def apply_student_exam_state(name, exam_key):
     clear_student_inputs()
     st.session_state.test_status = state["status"]
     st.session_state.attempt = attempt_from_status(state["status"])
+    st.session_state.retake_base = state["retake_base"]  # 🔄 [재응시] None = 원래 회차
     st.session_state.user_inputs = state["answers"]
     st.session_state.feedback = state["feedback"]
     st.session_state.submitted_answers = state["submitted"]
@@ -2210,6 +2273,42 @@ def prepare_ta_inputs(q_id, chunks, shapes_on=False):
     st.session_state[memory_key] = memory
 
 
+def ta_box_label(value):
+    # 👆 [G-1] 성분 상자에 보일 글자: 지금 칸 값 그대로 (빈 칸은 ＋, 마크다운 기호는 글자 그대로 보이게)
+    text = str(value or "").strip()
+    if not text:
+        return "＋"
+    return re.sub(r"([\\`*_\[\]<>#~$|])", r"\\\1", text)
+
+
+def _ta_pick(q_id, i, g):
+    # 👆 [G-1] 성분 버튼: 칸 값을 그 성분으로 바꿔 넣음 → 버튼은 다시 해제 (같은 버튼을 또 눌러도 그대로)
+    #    값은 예전 타자 칸(input_ta_…)에 넣으므로 채점·임시저장·칸 옮기기는 타자로 쓴 것과 똑같음
+    pick_key = f"tapick_{q_id}_{i}_{g}"
+    value = st.session_state.get(pick_key)
+    if value:
+        st.session_state[f"input_ta_{q_id}_{i}"] = value
+    st.session_state[pick_key] = None
+
+
+def _ta_clear(q_id, i):
+    # 👆 [G-1] 🧹 지우기: 성분만 비움 (△/□ 도형은 칸 아래 버튼으로 따로)
+    st.session_state[f"input_ta_{q_id}_{i}"] = ""
+
+
+def render_ta_pick_panel(q_id, i):
+    # 👆 [G-1] 성분 판 버튼: 정답과 상관없이 모든 칸에 똑같음 (힌트 방지)
+    #    버튼 이름표(key)는 'input_'으로 시작하지 않게 (임시저장·답안에 섞이지 않도록)
+    for g, (title, items) in enumerate(TA_PICK_GROUPS):
+        st.pills(
+            title,
+            items,
+            key=f"tapick_{q_id}_{i}_{g}",
+            on_change=_ta_pick,
+            args=(q_id, i, g),
+        )
+
+
 # ==========================================
 # [화면 구성] Streamlit UI
 # ==========================================
@@ -2275,6 +2374,12 @@ st.markdown(
     [class*="st-key-compose_add_btn"] button, [class*="st-key-compose_add_btn"] button *,
     [class*="st-key-ta_popover"] button, [class*="st-key-ta_popover"] button * {
         color: #2A3346 !important;
+    }
+    /* 👆 [G-1] 학생 성분 판 버튼: 손가락으로 누르기 쉽게 크게 */
+    [class*="st-key-tapick_"] button {
+        min-height: 2.6rem !important;
+        min-width: 3.2rem !important;
+        font-size: 1.05rem !important;
     }
     .stButton > button[kind="secondary"] {
         border: 1px solid #D0D3D9 !important;
@@ -2962,7 +3067,7 @@ if not st.session_state.started:
             """
         <div class="splash-container">
             <div class="main-title">SETE</div>
-            <div class="sub-title">TA 자동 채점 시스템 (Ver 2.1)</div>
+            <div class="sub-title">TA 자동 채점 시스템 (Ver 3.1)</div>
         </div>
         <div class="lsb-footer">made by LSB</div>
         """,
@@ -3071,7 +3176,7 @@ if st.session_state.role == "teacher":
             "🗂️ **[시험 선택]** 위에서 시험(출제한 세트 묶음)을 고르면 그 시험의 성적만 보여요! 같은 세트 묶음을 다시 출제하면 이전 기록이 이어집니다.\n\n"
             "✏️ **[점수 수정]** AI 판정이 애매하다면 아래 상세 답안지를 확인한 뒤 표의 오답 수를 고치고 저장하세요. 통과·진행·선생님 호출 상태는 자동으로 다시 계산되고, 고친 차수는 답안지에 ✏️ 표시가 남아요.\n\n"
             "🗑️ **[기록 삭제]** 🗑️ 칸을 체크하고 저장하면 **이 시험의 해당 학생 기록만** 삭제돼요. 다른 시험 기록은 안전합니다.\n\n"
-            "🔄 **[재응시]** 학생을 골라 `재응시 허용`을 누르면 그 학생만 1차부터 다시 볼 수 있어요! 복습으로 같은 세트를 다시 낼 때는 `전체 재응시`를 사용하세요. 이전 기록은 상세 답안지에서 회차별로 확인할 수 있습니다.\n\n"
+            "🔄 **[재응시]** '선생님 호출' 학생을 골라 `재응시 허용`을 누르면, 그 학생은 마지막으로 제출한 시험지(채점 표시 포함)에서 **이어서 3번 더** 풀 수 있어요! 기록은 `재응시1`, `재응시2`…로 남고, 재응시 뒤 통과하면 `3+2차 PASS`처럼 표시됩니다. 표의 1·2·3차 오답 칸은 지금 풀고 있는 회차를 보여 줍니다. 같은 문제를 처음부터 복습시키려면 세트 이름을 바꿔 다시 출제하세요.\n\n"
             "🔍 **[상세 답안지]** 학생이 구문을 어떻게 나눴는지, 칸별 결과(✅ 정답 / ❌ 오답 / ✂️ 나눈 위치가 다름), 괄호 오류, AI 판정 사유까지 한눈에 보여요! 지금 출제 중인 시험은 제출 전 작성 중인 답안도 볼 수 있습니다.",
         )
 
@@ -3224,13 +3329,15 @@ if st.session_state.role == "teacher":
                         "2차 오답": att[2]["wrong_count"] if 2 in att else None,
                         "3차 오답": att[3]["wrong_count"] if 3 in att else None,
                         "문항 수": total,
-                        "상태": status_label(r["status"]),
-                        "회차": r["round_no"],
+                        "상태": record_status_label(
+                            r["status"], r["round_no"], r["round_counts"]
+                        ),
+                        "재응시": int(r["round_no"] or 1) - 1,
                         "마지막 제출": last_at[5:16] if last_at else "-",
                     }
                 )
             table = pd.DataFrame(rows)
-            for col in ["1차 오답", "2차 오답", "3차 오답", "문항 수", "회차"]:
+            for col in ["1차 오답", "2차 오답", "3차 오답", "문항 수", "재응시"]:
                 table[col] = table[col].astype("Int64")
 
             edited = st.data_editor(
@@ -3238,7 +3345,7 @@ if st.session_state.role == "teacher":
                 hide_index=True,
                 num_rows="fixed",
                 use_container_width=True,
-                disabled=["이름", "문항 수", "상태", "회차", "마지막 제출"],
+                disabled=["이름", "문항 수", "상태", "재응시", "마지막 제출"],
                 column_config={
                     "삭제": st.column_config.CheckboxColumn("🗑️ 삭제", default=False),
                     "1차 오답": st.column_config.NumberColumn(
@@ -3250,8 +3357,9 @@ if st.session_state.role == "teacher":
                     "3차 오답": st.column_config.NumberColumn(
                         "3차 오답", min_value=0, step=1
                     ),
-                    "회차": st.column_config.NumberColumn(
-                        "회차", help="재응시를 허용할 때마다 1씩 늘어납니다."
+                    "재응시": st.column_config.NumberColumn(
+                        "재응시",
+                        help="재응시를 허용받은 횟수입니다. 1 이상이면 1·2·3차 오답 칸은 재응시 제출입니다.",
                     ),
                 },
                 key=f"records_editor_{exam_key}_{nonce}",
@@ -3302,14 +3410,19 @@ if st.session_state.role == "teacher":
                 st.session_state.records_nonce = nonce + 1
                 return "rerun"
 
-            # ---------- 재응시 ----------
+            # ---------- 재응시 (🔄 선생님 호출 학생만, 이어서 3번 더) ----------
             st.markdown("#### 🔄 재응시")
+            fail_names = [r["student_name"] for r in records if r["status"] == "FAIL"]
             col_pick, col_btn = st.columns([4, 1], vertical_alignment="bottom")
             with col_pick:
                 picked = st.multiselect(
-                    "재응시를 허용할 학생",
-                    [r["student_name"] for r in records],
-                    placeholder="학생을 선택하세요",
+                    "재응시를 허용할 학생 (🚨 선생님 호출 학생만)",
+                    fail_names,
+                    placeholder=(
+                        "학생을 선택하세요"
+                        if fail_names
+                        else "지금 선생님 호출 학생이 없습니다"
+                    ),
                     key=f"retake_pick_{exam_key}_{nonce}",
                 )
             with col_btn:
@@ -3319,27 +3432,19 @@ if st.session_state.role == "teacher":
                     use_container_width=True,
                     key="retake_btn",
                 )
-            with st.expander("⚠️ 전체 재응시 (이 시험의 모든 학생)"):
-                confirm_all = st.checkbox(
-                    "이 시험을 제출한 모든 학생이 1차부터 다시 응시하게 합니다.",
-                    key=f"retake_all_confirm_{exam_key}_{nonce}",
-                )
-                retake_all_clicked = st.button(
-                    "🔄 전체 재응시", disabled=not confirm_all, key="retake_all_btn"
-                )
 
-            if retake_clicked or retake_all_clicked:
+            if retake_clicked:
                 try:
-                    count = reset_exam(exam_key, None if retake_all_clicked else picked)
+                    count = reset_exam(exam_key, picked)
                 except Exception as e:
                     print(f"[DB] 재응시 처리 실패: {e}")
                     st.error(
                         "🚨 재응시 처리를 하지 못했습니다. 잠시 후 다시 시도해 주세요."
                     )
                     return None
-                msg = f"🔄 {count}명이 1차부터 다시 응시할 수 있게 되었어요!"
-                if not retake_all_clicked and count < len(picked):
-                    msg += f" (제출 기록이 없는 {len(picked) - count}명은 그대로 두었습니다)"
+                msg = f"🔄 {count}명이 이어서 3번 더 풀 수 있게 되었어요!"
+                if count < len(picked):
+                    msg += f" (선생님 호출 상태가 아닌 {len(picked) - count}명은 그대로 두었습니다)"
                 st.session_state.records_msg = msg
                 st.session_state.records_nonce = nonce + 1
                 return "rerun"
@@ -3358,7 +3463,6 @@ if st.session_state.role == "teacher":
                 return None
 
             attempts = get_student_attempts(detail_name, exam_key)
-            multi_round = any(a["round_no"] > 1 for a in attempts)
             sheets = []  # (표시 이름, 답안지 정보) — 최신 것부터
             if exam_key == current_exam_key:
                 draft = get_student_draft(detail_name, exam_key)
@@ -3369,11 +3473,18 @@ if st.session_state.role == "teacher":
                             {"draft": draft},
                         )
                     )
-            for a in reversed(attempts):
-                round_label = f"{a['round_no']}회차 · " if multi_round else ""
+            # 🔄 [재응시] 원래 회차는 'n차 제출', 그 뒤 제출은 순서대로 '재응시n 제출' (실제 제출 순서로 셈)
+            sheet_names, retake_no = [], 0
+            for a in attempts:
+                if a["round_no"] > 1:
+                    retake_no += 1
+                    sheet_names.append(f"재응시{retake_no}")
+                else:
+                    sheet_names.append(f"{a['attempt_no']}차")
+            for a, sheet_name in zip(reversed(attempts), reversed(sheet_names)):
                 sheets.append(
                     (
-                        f"{round_label}{a['attempt_no']}차 제출 (오답 {a['wrong_count']} / {a['total_count']}, {(a['submitted_at'] or '')[5:16]})",
+                        f"{sheet_name} 제출 (오답 {a['wrong_count']} / {a['total_count']}, {(a['submitted_at'] or '')[5:16]})",
                         {"attempt": a},
                     )
                 )
@@ -3638,7 +3749,7 @@ if st.session_state.role == "teacher":
         st.markdown("""
         ### 1. 🎯 채점 원리
         
-        *   **문항 정답 기준:** 한 문항은 **구문 나누기·괄호·성분·해석이 모두 맞아야** 정답입니다. 모든 문항을 맞힌 차수에 `PASS_1`(1차 통과)처럼 기록되고, 3차까지 통과하지 못하면 `FAIL`이 되어 선생님 확인이 필요한 상태가 됩니다.
+        *   **문항 정답 기준:** 한 문항은 **구문 나누기·괄호·성분·해석이 모두 맞아야** 정답입니다. 모든 문항을 맞힌 차수에 `PASS_1`(1차 통과)처럼 기록되고, 3차까지 통과하지 못하면 `FAIL`이 되어 선생님 확인이 필요한 상태가 됩니다. 재응시를 허용하면 이전 제출은 그대로 보관된 채, 학생이 마지막 답안과 채점 표시를 이어받아 3번 더 풀 수 있습니다.
         
         *   **구문 나누기:** 슬래시(`/`)의 **위치까지** 채점합니다. 띄어쓰기나 문장부호(쉼표·세미콜론·따옴표 등) 앞뒤 어디에 쳐도 같은 답으로 보며(`I/ love/you.` = `I / love / you.`), 단어 중간을 나누면 오답입니다.
         
@@ -3657,7 +3768,8 @@ if st.session_state.role == "teacher":
         st.divider()
         st.write("<br>", unsafe_allow_html=True)
 
-        st.markdown("""
+        st.markdown(
+            """
         ### 2. 👧 학생 화면에서 일어나는 일
         
         *   **써 둔 답 보호:** 괄호를 잘못 쳐도 써 둔 성분·해석이 사라지지 않습니다. 슬래시를 넣거나 빼도 **내용이 같은 칸의 성분은 그대로 따라갑니다.**
@@ -3667,7 +3779,9 @@ if st.session_state.role == "teacher":
         *   **채점 결과 표시:** 채점 후 칸마다 ✅ / ❌ / ✂️가 표시됩니다. 학생이 고친 칸은 '**✏️ 수정됨**'으로 바뀌어, 다시 제출할 부분을 스스로 파악할 수 있습니다.
         
         *   **태블릿·PC 최적화:** 화면 폭에 맞춰 나뉜 구문이 알아서 줄바꿈되어, 아이패드에서도 찌그러지지 않습니다.
-        """)
+
+        *   **성분 버튼:** 판에서 고른 성분은 학생이 직접 쓴 것과 똑같은 글자로 칸에 들어가 똑같이 채점됩니다. 판은 정답과 상관없이 모든 칸에 똑같이 나오므로 힌트가 되지 않습니다.        """
+        )
 
         st.write("<br>", unsafe_allow_html=True)
         st.divider()
@@ -3772,31 +3886,31 @@ elif st.session_state.role == "student":
             else set()
         )
 
+        # 📒 학생 가이드: 초등학생이 꼭 읽을 것만 (짧으면 '~기', 길면 '~세요/~니다'), 제목만 크게
         guide_text = (
-            "🎓 **학생 응시 가이드라인:** 원문장을 읽고, 아래 입력창에서 슬래시(`/`)로 구문을 나누고 성분을 채우십시오.\n\n"
-            "🧩 **[스마트 입력창]** 문장이 길어도 자동으로 줄바꿈이 됩니다. 엔터를 쳐도 화면이 튕기지 않으니 편하게 작성하십시오. ✍️\n\n"
-            "✂️ **[구문 나누기]** 슬래시는 띄어쓰기 앞뒤 어디에 쳐도 괜찮지만, **나눈 위치가 정확해야** 정답입니다. 원문의 단어를 지우거나 바꾸면 제출할 수 없습니다.\n\n"
-            "🏷️ **[성분 쓰기]** 한 칸에 성분이 둘 이상이면 `adv(Vt)`처럼 괄호로 함께 쓰십시오. **모두 써야 정답**이며, 순서와 대소문자는 상관없습니다.\n\n"
-            "🔺 **[연결어 표시]** 칸 아래에 `△ 관계사` `□ 접속사` 버튼이 보이면, 관계사 칸은 △, 접속사 칸은 □를 누르십시오. 다시 누르면 해제됩니다. 버튼이 있다고 모두 연결어는 아니므로, 연결어가 아니면 누르지 마십시오. 표시가 틀리거나 빠지면 그 칸은 오답입니다.\n\n"
-            "👻 **[기호 및 빈칸]** 괄호 `()`, `[]`는 짝과 위치를 정확히 맞추십시오. 괄호가 틀려도 성분과 해석은 먼저 쓸 수 있지만, **그대로 제출하면 그 문항은 오답**입니다. 채울 성분이 없는 투명 빈칸은 그대로 비워두고 제출하십시오.\n\n"
-            "✌️ **[중간저장 활용]** 입력하는 동안 답안이 약 1분 간격으로 자동 저장됩니다. 자리를 비우거나 태블릿을 끄기 전에는 왼쪽 사이드바의 `💾 임시저장` 버튼을 한 번 더 눌러주십시오!"
+            "#### 🎓 꼭 읽고 시작하기!\n\n"
+            "📒 **[필기대로]** 정답은 **선생님 필기 그대로**예요. 헷갈리면 필기를 떠올려 보세요.\n\n"
+            "✂️ **[나누기]** 괄호 앞뒤도 `/` 나누기. `/` 위치가 하나만 달라도 그 칸은 오답입니다.  \n"
+            "예) `He / runs / (in a park).`\n\n"
+            "🔲 **[대괄호 `[ ]`]** 절(문장 속 문장)에만 치기. 대괄호 첫 칸 성분은 필기에 있을 때만 쓰세요.  \n"
+            "예) `I / wonder / [if / he / can / swim].`\n\n"
+            "🏃 **[to부정사]** 끝까지 나누고, 첫 번째 to 칸에 전체 성분 쓰기.  \n"
+            "예) `To / keep / a record of errors~` → `To` 칸 `S`, `keep` 칸 `Vt`\n\n"
+            "🏷️ **[성분 여러 개]** 한 칸에 성분이 여러 개면 **하나라도 빠지면 오답!** 판 아래 ⌨️ 직접 쓰기 칸에 `분구(Vt)`처럼 모두 쓰세요.\n\n"
+            "💾 **[저장]** 자리를 비우기 전에 왼쪽 `💾 임시저장` 누르기."
         )
         if "전체 해석" in active_modes:
-            guide_text += "\n\n📝 **[전체 해석]** 뜻이 통하면 자연스럽게 써도 됩니다! 단, 문장의 일부만 쓰면 오답입니다."
-        if "핵심구 해석" in active_modes:
             guide_text += (
-                "\n\n🎯 **[핵심 해석 쓰는 법]** 문장을 전부 옮기지 않아도 됩니다!  \n"
-                "✔ 꼭 넣기: 누가(무엇이) + 어쩐다(어떻다) + 무엇을  \n"
-                "✔ 빼도 됩니다: 언제·어디서·어떻게 같은 꾸며주는 말, 사람·장소 이름  \n"
-                '✔ 줄여 써도 됩니다: "교육이 중요해진다" → "교육 중요"  \n'
-                '⚠ 주의: "\\~않다, 못하다"는 빼면 안 됩니다! 뜻을 반대로 쓰면 오답입니다.'
+                "\n\n📝 **[전체 해석]** 문장 전체 해석하기. 일부만 쓰면 오답입니다."
             )
+        if "핵심구 해석" in active_modes:
+            guide_text += '\n\n🎯 **[핵심 해석]** 누가 + 어쩐다 + 무엇을만 쓰면 됩니다. "\\~않다, 못하다"는 빼면 안 돼요.'
         st.info(guide_text)
 
         col_s1, col_s2 = st.columns([5, 1])
         with col_s1:
             st.markdown(
-                f"### 👧 {st.session_state.student_name} 학생의 TA 테스트 (현재 {st.session_state.attempt}차)"
+                f"### 👧 {st.session_state.student_name} 학생의 TA 테스트 (현재 {attempt_label(st.session_state.attempt, st.session_state.get('retake_base'))})"
             )
         with col_s2:
             render_ta_guideline_popover()
@@ -3804,6 +3918,8 @@ elif st.session_state.role == "student":
         if st.session_state.test_status.startswith("PASS"):
             st.success(
                 f"🎉 {st.session_state.test_status.split('_')[1]}차 시도 최종 통과! 고생했어요! 🎉"
+                if st.session_state.get("retake_base") is None
+                else f"🎉 {attempt_label(attempt_from_status(st.session_state.test_status), st.session_state.retake_base)}에서 최종 통과! 고생했어요! 🎉"
             )
             if st.button("처음으로 돌아가기 🔙"):
                 st.session_state.clear()
@@ -3817,6 +3933,12 @@ elif st.session_state.role == "student":
                 st.session_state.clear()
                 st.rerun()
             st.stop()
+
+        # 🔄 [재응시] 재응시 중이면 안내 한 줄
+        if st.session_state.get("retake_base") is not None:
+            st.info(
+                "🔄 **재응시:** 선생님과 이야기한 내용을 생각하며 ❌ 칸을 고쳐 제출하십시오."
+            )
 
         # 👉 [추가] 사이드바 임시저장 UI 및 세션 데이터 수집 로직
         with st.sidebar:
@@ -4002,12 +4124,20 @@ elif st.session_state.role == "student":
                                     "<div class='fb-fail'>❌ 오답</div>",
                                     unsafe_allow_html=True,
                                 )
-                        # 💡 값은 prepare_ta_inputs가 미리 넣어 둠 (value를 따로 주지 않음)
-                        val = st.text_input(
-                            "태그 입력",
-                            key=widget_key,
-                            label_visibility="collapsed",
-                        )
+                        # 👆 [G-1] 성분 상자: 지금 값을 보여 주고, 누르면 성분 판이 열림 (빈 칸은 ＋)
+                        #    판 안의 '직접 쓰기' 칸 = 예전 타자 칸 그대로 (값은 prepare_ta_inputs가 미리 넣어 둠, value를 따로 주지 않음)
+                        with st.popover(
+                            ta_box_label(st.session_state.get(widget_key, "")),
+                            use_container_width=True,
+                        ):
+                            render_ta_pick_panel(q_id, original_i)
+                            val = st.text_input(TA_TYPE_LABEL, key=widget_key)
+                            st.button(
+                                "🧹 지우기",
+                                key=f"taclear_{q_id}_{original_i}",
+                                on_click=_ta_clear,
+                                args=(q_id, original_i),
+                            )
                         local_inputs[input_key] = val
                         if has_shape_button:
                             shape_val = st.segmented_control(
@@ -4077,7 +4207,7 @@ elif st.session_state.role == "student":
             )
 
         if st.button(
-            f"🚀 {st.session_state.attempt}차 제출 및 채점하기",
+            f"🚀 {attempt_label(st.session_state.attempt, st.session_state.get('retake_base'))} 제출 및 채점하기",
             type="primary",
             disabled=submit_disabled,
         ):
